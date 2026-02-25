@@ -27,6 +27,7 @@ class YeeduNotebookRunOperator:
         connection_id: str,
         token_variable_name: str,
         restapi_port: int,
+        task_cluster_id: int = None,
         arguments: str = None,
         conf: list = None,
         cluster_ids: list = None,
@@ -42,6 +43,7 @@ class YeeduNotebookRunOperator:
         self.connection_id = connection_id
         self.token_variable_name = token_variable_name
         self.restapi_port = restapi_port
+        self.task_cluster_id = task_cluster_id
         self.arguments = arguments
         self.conf = conf
         self.cluster_ids = cluster_ids or []
@@ -173,19 +175,31 @@ class YeeduNotebookRunOperator:
             self.log.error(f"Failed to bump cluster: {e}")
             return False
 
-    def create_notebook_instance(self):
+    def create_notebook_instance(self, context=None):
         try:
             data = {
                 "notebook_id": self.notebook_id,
                 "is_background": True
             }
+            if self.task_cluster_id is not None:
+                data['cluster_id'] = self.task_cluster_id
             if self.arguments:
                 data['arguments'] = self.arguments
             if self.conf:
                 data['conf'] = self.conf
+                
+            # Add context values
+            if context:
+                ti = context.get('ti')
+                if ti:
+                    data['task_name'] = ti.task_id
+                    data['dag_id'] = ti.dag_id
+                    data['dag_run_id'] = ti.run_id
+                    data['task_instance_id'] = str(ti.id) if ti.id else None  # Convert UUID to string
+                    data['try_number'] = ti.try_number
+                    
             post_url = self.base_url + \
                 f'workspace/{self.workspace_id}/notebook/run'
-            data = data
 
             response = self.hook._api_request("POST", post_url, data)
 
@@ -1245,6 +1259,9 @@ class YeeduNotebookRunOperator:
                 self.log.warning(f"Failed to close HTTP session: {e}")
 
     def execute(self, context: dict):
+        user_token_id = None
+        use_master_token_flow = False
+
         try:
             ti = context['ti']
 
@@ -1254,12 +1271,43 @@ class YeeduNotebookRunOperator:
             if self.conf is None:
                 self.conf = []
 
-            self.conf.append(f"spark.yeedu.dag_id={ti.dag_id}")
-            self.conf.append(f"spark.yeedu.dag_run_id={ti.run_id}")
-            self.conf.append(f"spark.yeedu.task_id={ti.task_id}")
-            self.conf.append(f"spark.yeedu.map_index={ti.map_index}")
+            # Check if connection_id is provided for traditional auth flow
+            if self.connection_id:
+                # Traditional flow: Use connection credentials to login
+                self.log.info("Using connection-based authentication flow")
+                self.hook.yeedu_login(context)
+            else:
+                # Pipeline flow: Use master token to create per-task user token
+                self.log.info("Using master token authentication flow for pipeline")
+                use_master_token_flow = True
 
-            self.hook.yeedu_login(context)
+                # 1. Extract username, dag_id from context/DAG params
+                username, dag_id = self.hook._get_username_dagid_from_context(context)
+                if not username:
+                    raise AirflowException("Username not found in DAG context for pipeline authentication")
+
+                # 2. Get tenant_id from workspace (workspace_id is prefix of dag_id)
+                workspace_id = dag_id.split("_")[0] if dag_id else None
+                if not workspace_id:
+                    raise AirflowException("Could not extract workspace_id from dag_id for pipeline authentication")
+
+                workspace_details = self.hook.get_workspace_details(int(workspace_id))
+                tenant_id = workspace_details.get('tenant_id')
+                if not tenant_id:
+                    raise AirflowException("tenant_id not found in workspace details")
+
+                # 3. Create user token using master token
+                self.log.info(f"Creating user token for username: {username}, tenant_id: {tenant_id}")
+                token_response = self.hook.create_user_token(username, tenant_id)
+                user_token_id = token_response.get('token_id')
+                user_token = token_response.get('token')
+
+                if not user_token:
+                    raise AirflowException("Failed to retrieve user token from response")
+
+                # 4. Update headers with user token
+                self.hook.set_headers({'Authorization': f'Bearer {user_token}'})
+                self.hook.session.headers.update(self.hook.get_headers())
 
             # Initialize cluster usage if cluster_ids provided
             if self.cluster_ids:
@@ -1285,7 +1333,7 @@ class YeeduNotebookRunOperator:
                         self.log.info(
                             "Executing notebook (no cluster bump configured)")
 
-                    self.create_notebook_instance()
+                    self.create_notebook_instance(context)
                     self.ws = self.connect_websocket()
                     rel.dispatch()
                     time.sleep(5)
@@ -1488,13 +1536,20 @@ class YeeduNotebookRunOperator:
                     "STOPPING"
                 ]:
                     self.exit_notebook(f"Exiting notebook from finally block.")
-            # Only logout for LDAP or AAD
+
+            # Cleanup: handle auth cleanup based on flow type
             try:
-                auth_type = self.hook.yeedu_auth_type
-                if auth_type in ["LDAP", "AAD"]:
-                    self.hook.yeedu_logout()
+                if use_master_token_flow and user_token_id:
+                    # Pipeline flow: Delete the user token created for this task
+                    self.log.info(f"Deleting user token with id: {user_token_id}")
+                    self.hook.delete_user_token(user_token_id)
+                else:
+                    # Traditional flow: Logout if using LDAP or AAD
+                    auth_type = self.hook.yeedu_auth_type
+                    if auth_type in ["LDAP", "AAD"]:
+                        self.hook.yeedu_logout()
             except Exception as e:
-                self.log.warning(f"Logout skipped or failed: {e}")
+                self.log.warning(f"Auth cleanup skipped or failed: {e}")
 
             self.cleanup()
             self.log.info("Cleanup completed in finally block.")

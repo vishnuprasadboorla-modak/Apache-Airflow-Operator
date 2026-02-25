@@ -17,6 +17,7 @@ class YeeduJobRunOperator:
         connection_id: str,
         token_variable_name: str,
         restapi_port: int,
+        task_cluster_id: int = None,
         arguments: str = None,
         conf: List[str] = None,
         cluster_ids: List[int] = None,
@@ -32,6 +33,7 @@ class YeeduJobRunOperator:
         self.connection_id = connection_id
         self.token_variable_name = token_variable_name
         self.restapi_port = restapi_port
+        self.task_cluster_id = task_cluster_id
         self.arguments = arguments
         self.conf = conf
         self.cluster_ids = cluster_ids or []
@@ -90,13 +92,14 @@ class YeeduJobRunOperator:
                 f"Failed log analysis for cluster bump decision: {e}")
             return False
 
-    def run_job(self, cluster_id=None) -> tuple:
+    def run_job(self, cluster_id=None, context=None) -> tuple:
         """
         Runs a job on a specified cluster and handles the complete job lifecycle.
 
         Args:
             cluster_id (int, optional): The cluster ID to run the job on. 
                                        If None, uses the existing cluster.
+            context (dict, optional): Airflow context containing task instance info
 
         Returns:
             tuple: (success, run_id, job_status, exception)
@@ -117,12 +120,34 @@ class YeeduJobRunOperator:
                 self.hook.update_job_cluster(
                     job_id=self.job_id, cluster_id=int(cluster_id))
 
-            # Submit job
+            # Extract context values
+            task_name = None
+            dag_id = None
+            dag_run_id = None
+            task_instance_id = None
+            try_number = None
+            
+            if context:
+                ti = context.get('ti')
+                if ti:
+                    task_name = ti.task_id
+                    dag_id = ti.dag_id
+                    dag_run_id = ti.run_id
+                    task_instance_id = str(ti.id) if ti.id else None  # Convert UUID to string
+                    try_number = ti.try_number
+
             self.log.info(f"Submitting job {self.job_id}")
             run_id = self.hook.submit_job(
-                self.job_id,
+                job_id=self.job_id,
+                task_cluster_id=self.task_cluster_id,
+                is_background=True,
                 arguments=self.arguments,
-                conf=self.conf
+                conf=self.conf,
+                task_name=task_name,
+                dag_id=dag_id,
+                dag_run_id=dag_run_id,
+                task_instance_id=task_instance_id,
+                try_number=try_number
             )
 
             # Store the run_id for templating and later use
@@ -193,10 +218,47 @@ class YeeduJobRunOperator:
         it will retry on subsequent clusters in the cluster_ids list.
         """
         clusters = self.cluster_ids[:] if self.cluster_ids else []
+        user_token_id = None
+        use_master_token_flow = False
 
         try:
-            # Login to Yeedu
-            self.hook.yeedu_login(context)
+            # Check if connection_id is provided for traditional auth flow
+            if self.connection_id:
+                # Traditional flow: Use connection credentials to login
+                self.log.info("Using connection-based authentication flow")
+                self.hook.yeedu_login(context)
+            else:
+                # Pipeline flow: Use master token to create per-task user token
+                self.log.info("Using master token authentication flow for pipeline")
+                use_master_token_flow = True
+
+                # 1. Extract username, dag_id from context/DAG params
+                username, dag_id = self.hook._get_username_dagid_from_context(context)
+                if not username:
+                    raise AirflowException("Username not found in DAG context for pipeline authentication")
+
+                # 2. Get tenant_id from workspace (workspace_id is prefix of dag_id)
+                workspace_id = dag_id.split("_")[0] if dag_id else None
+                if not workspace_id:
+                    raise AirflowException("Could not extract workspace_id from dag_id for pipeline authentication")
+
+                workspace_details = self.hook.get_workspace_details(int(workspace_id))
+                tenant_id = workspace_details.get('tenant_id')
+                if not tenant_id:
+                    raise AirflowException("tenant_id not found in workspace details")
+
+                # 3. Create user token using master token
+                self.log.info(f"Creating user token for username: {username}, tenant_id: {tenant_id}")
+                token_response = self.hook.create_user_token(username, tenant_id)
+                user_token_id = token_response.get('token_id')
+                user_token = token_response.get('token')
+
+                if not user_token:
+                    raise AirflowException("Failed to retrieve user token from response")
+
+                # 4. Update headers with user token
+                self.hook.set_headers({'Authorization': f'Bearer {user_token}'})
+                self.hook.session.headers.update(self.hook.get_headers())
 
             if self.cluster_ids:
                 self.log.info(
@@ -207,7 +269,7 @@ class YeeduJobRunOperator:
             self.log.info(
                 f"Running job {self.job_id} on the existing cluster configuration"
             )
-            success, run_id, job_status, exception = self.run_job()
+            success, run_id, job_status, exception = self.run_job(context=context)
 
             # If job succeeded, we're done
             if success:
@@ -289,13 +351,19 @@ class YeeduJobRunOperator:
             raise
 
         finally:
-            # Cleanup: logout and close connections
+            # Cleanup: handle auth cleanup based on flow type
             try:
-                auth_type = self.hook.yeedu_auth_type
-                if auth_type in ["LDAP", "AAD"]:
-                    self.hook.yeedu_logout()
+                if use_master_token_flow and user_token_id:
+                    # Pipeline flow: Delete the user token created for this task
+                    self.log.info(f"Deleting user token with id: {user_token_id}")
+                    self.hook.delete_user_token(user_token_id)
+                else:
+                    # Traditional flow: Logout if using LDAP or AAD
+                    auth_type = self.hook.yeedu_auth_type
+                    if auth_type in ["LDAP", "AAD"]:
+                        self.hook.yeedu_logout()
             except Exception as e:
-                self.log.warning(f"Logout skipped or failed: {e}")
+                self.log.warning(f"Auth cleanup skipped or failed: {e}")
 
             # Close HTTP session if it exists
             if hasattr(self, 'hook') and hasattr(self.hook, 'session'):

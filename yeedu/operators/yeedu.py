@@ -33,8 +33,9 @@ class YeeduOperator(BaseOperator):
     def __init__(
         self,
         job_url: str,
-        connection_id: str,
+        connection_id: str = None,
         token_variable_name: str = None,
+        task_cluster_id: int = None,
         arguments: str = None,
         loop_input: str = None,
         conf: List[str] = None,
@@ -90,6 +91,7 @@ class YeeduOperator(BaseOperator):
         self.job_url = job_url
         self.connection_id = connection_id
         self.token_variable_name = token_variable_name
+        self.task_cluster_id = task_cluster_id
         self.arguments = arguments
         self.loop_input = loop_input
         self.cluster_ids = self._prepare_cluster_ids(cluster_ids)
@@ -225,6 +227,7 @@ class YeeduOperator(BaseOperator):
                 connection_id=self.connection_id,
                 token_variable_name=self.token_variable_name,
                 restapi_port=self.restapi_port,
+                task_cluster_id=self.task_cluster_id,
                 arguments=self.arguments,
                 conf=self.conf,
                 cluster_ids=self.cluster_ids,
@@ -240,6 +243,7 @@ class YeeduOperator(BaseOperator):
                 connection_id=self.connection_id,
                 token_variable_name=self.token_variable_name,
                 restapi_port=self.restapi_port,
+                task_cluster_id=self.task_cluster_id,
                 arguments=self.arguments,
                 conf=self.conf,
                 cluster_ids=self.cluster_ids,

@@ -10,6 +10,8 @@ from airflow.utils.trigger_rule import TriggerRule
 
 from yeedu.utils.common import (
     resolve_runtime_expr,
+    resolve_all_task_params,
+    resolve_foreach_input,
     tr,
     retry_delay_from_milliseconds,
     build_job_url,
@@ -54,7 +56,10 @@ class YeeduRuntimeHook(BaseHook):
         Returns:
             The resolved expression
         """
-        return resolve_runtime_expr(expr, context)
+        self.log.info("[YeeduRuntimeHook.resolve_expression] BEFORE: %r", expr)
+        result = resolve_runtime_expr(expr, context)
+        self.log.info("[YeeduRuntimeHook.resolve_expression] AFTER:  %r → %r", expr, result)
+        return result
 
     def get_job_metadata(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -107,6 +112,7 @@ class YeeduRuntimeHook(BaseHook):
     def resolve_parameters(self, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """
         Resolve all runtime expressions in a parameters dictionary.
+        Handles nested dicts and lists recursively.
 
         Args:
             params: Dictionary of parameters that may contain expressions
@@ -115,10 +121,39 @@ class YeeduRuntimeHook(BaseHook):
         Returns:
             Dictionary with all expressions resolved
         """
-        resolved_params = {}
-        for key, value in params.items():
-            resolved_params[key] = self.resolve_expression(value, context)
-        return resolved_params
+        self.log.info("[YeeduRuntimeHook.resolve_parameters] BEFORE: %s", params)
+        resolved = resolve_all_task_params(params, context)
+        self.log.info("[YeeduRuntimeHook.resolve_parameters] AFTER:  %s", resolved)
+        return resolved
+
+    def resolve_foreach_input(
+        self,
+        expr: str,
+        tasks_dict: Dict[str, Any],
+        dag_params: Dict[str, Any] | None = None,
+        task_params: Dict[str, Any] | None = None,
+    ) -> Any:
+        """
+        Resolve a for_each input expression for .expand(loop_input=...).
+
+        Returns a static list or XComArg depending on the expression:
+          - "[1,2,3]" → [1, 2, 3]
+          - "{{ tasks.X.values.Y }}" → XComArg(tasks["X"], key="Y")
+          - "{{ job.parameters.P }}" → parsed list from dag_params
+          - "{{ task.parameters.P }}" → parsed list from task_params
+
+        Args:
+            expr: The for_each input expression
+            tasks_dict: DAG's tasks dict (task_id → operator)
+            dag_params: DAG-level parameters for job.parameters.* resolution
+            task_params: Task-level parameters for task.parameters.* resolution
+        """
+        self.log.info("[YeeduRuntimeHook.resolve_foreach_input] BEFORE: expr=%r, dag_params=%s, task_params=%s",
+                      expr, dag_params, task_params)
+        result = resolve_foreach_input(expr, tasks_dict, dag_params, task_params)
+        self.log.info("[YeeduRuntimeHook.resolve_foreach_input] AFTER:  expr=%r → %r (type=%s)",
+                      expr, result, type(result).__name__)
+        return result
 
     # Utility methods
     @staticmethod
@@ -132,9 +167,17 @@ class YeeduRuntimeHook(BaseHook):
         return retry_delay_from_milliseconds(milliseconds)
 
     @staticmethod
-    def build_job_url(job_id: int, job_kind: str) -> str:
+    def build_job_url(
+        job_id: int,
+        job_kind: str,
+        workspace_id: int,
+        tenant_id: str,
+        hostname: str,
+        port: int,
+        ssl_enabled: str
+    ) -> str:
         """Build Yeedu job URL."""
-        return build_job_url(job_id, job_kind)
+        return build_job_url(job_id, job_kind, workspace_id, tenant_id, hostname, port, ssl_enabled)
 
     @staticmethod
     def pipeline_to_dag_id(pipeline_id: int | str) -> str:

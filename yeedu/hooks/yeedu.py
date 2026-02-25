@@ -60,9 +60,16 @@ class YeeduHook(BaseHook):
         self.conf_id = conf_id
         self.workspace_id = workspace_id
         self.connection_id = connection_id
-        self.connection = self.get_connection(self.connection_id)
         self.base_url: str = base_url
         self.token_variable_name = token_variable_name
+
+        # For pipeline flow, connection_id will be None - use master token connection for SSL config
+        if self.connection_id:
+            self.connection = self.get_connection(self.connection_id)
+        else:
+            # Use master token connection for SSL configuration in pipeline flow
+            self.connection = self.get_connection("yeedu_master_token")
+
         self.YEEDU_SSL_CERT_FILE = self.connection.extra_dejson.get(
             'YEEDU_SSL_CERT_FILE')
         self.YEEDU_AIRFLOW_VERIFY_SSL = self.connection.extra_dejson.get(
@@ -145,7 +152,7 @@ class YeeduHook(BaseHook):
             raise AirflowException(
                 f"The current AirflowOperator only supports LDAP, AAD, and Azure_SSO authentication types, but received {auth_type}.")
 
-    def _api_request(self, method: str, url: str, data=None, params: Optional[Dict] = None, max_attempts: int = 5, delay: int = 20, skip_retry: bool = False) -> requests.Response:
+    def _api_request(self, method: str, url: str, data=None, params: Optional[Dict] = None, max_attempts: int = 5, delay: int = 20, skip_retry: bool = False, headers: Optional[Dict] = None) -> requests.Response:
         """
         Makes an HTTP request to the Yeedu API with retries.
 
@@ -156,6 +163,7 @@ class YeeduHook(BaseHook):
         :param max_attempts: Maximum number of retry attempts.
         :param delay: Delay between retries in seconds.
         :param skip_retry: If True, skip the retry logic and return the response directly.
+        :param headers: Optional custom headers (overrides default headers if provided).
         :return: The API response.
         :raises AirflowException: If continuous request failures reach the threshold.
         """
@@ -167,13 +175,16 @@ class YeeduHook(BaseHook):
             self.session.headers.update(
                 {'Authorization': f"Bearer {self.auth_token}"})
 
+        # Use custom headers if provided, otherwise use default headers
+        request_headers = headers if headers is not None else self.get_headers()
+
         try:
             # Single attempt if skip_retry is True
             if skip_retry:
                 response = self.session.request(
                     method=method,
                     url=url,
-                    headers=self.get_headers(),
+                    headers=request_headers,
                     json=data,
                     params=params,
                     timeout=self.request_timeout
@@ -188,7 +199,7 @@ class YeeduHook(BaseHook):
                     response = self.session.request(
                         method=method,
                         url=url,
-                        headers=self.get_headers(),
+                        headers=request_headers,
                         json=data,
                         params=params,
                         timeout=self.request_timeout
@@ -376,25 +387,50 @@ class YeeduHook(BaseHook):
         health_check_url: str = self.base_url + f'healthCheck'
         return self._api_request('GET', health_check_url)
 
-    def submit_job(self, job_id: str, arguments: str = None, conf: List[str] = None) -> int:
+    def submit_job(self, job_id: str, task_cluster_id: int = None, is_background: bool = True, 
+                   arguments: str = None, conf: List[str] = None, 
+                   task_name: str = None, dag_id: str = None, dag_run_id: str = None, 
+                   task_instance_id: str = None, try_number: int = None) -> int:
         """
         Submits a job to Yeedu.
 
         :param job_id: The job ID.
+        :param task_cluster_id: Optional cluster ID to run the job on
+        :param is_background: Whether this is a background job (default: True)
         :param arguments: Optional arguments to pass to the job
         :param conf: Optional configuration for the job
+        :param task_name: Optional task name
+        :param dag_id: Optional DAG ID
+        :param dag_run_id: Optional DAG run ID
+        :param task_instance_id: Optional task instance ID
+        :param try_number: Optional try number
         :return: The ID of the submitted job.
         """
 
         try:
             job_url: str = self.base_url + \
                 f'workspace/{self.workspace_id}/spark/job/run'
-            data: dict = {'job_id': job_id}
+            data: dict = {
+                'job_id': job_id,
+                'is_background': is_background
+            }
 
+            if task_cluster_id is not None:
+                data['cluster_id'] = task_cluster_id
             if arguments is not None:
                 data['arguments'] = arguments
             if conf is not None:
                 data['conf'] = conf
+            if task_name is not None:
+                data['task_name'] = task_name
+            if dag_id is not None:
+                data['dag_id'] = dag_id
+            if dag_run_id is not None:
+                data['dag_run_id'] = dag_run_id
+            if task_instance_id is not None:
+                data['task_instance_id'] = task_instance_id
+            if try_number is not None:
+                data['try_number'] = try_number
 
             response = self._api_request('POST', job_url, data)
             api_status_code = response.status_code
@@ -635,3 +671,82 @@ class YeeduHook(BaseHook):
             self.log.warning(
                 f"Failed to fetch job workflow errors for run {run_id}: {e}")
             raise AirflowException(e)
+            
+    def get_master_token(self) -> str:
+        """Retrieve master token from 'yeedu_master_token' Airflow connection"""
+        conn = BaseHook.get_connection("yeedu_master_token")
+        return conn.password
+
+    def create_user_token(self, username: str, tenant_id: str) -> dict:
+        """
+        Create user token using master token
+        POST /api/v1/user/token
+        with username and tenant_id
+        Returns: {'token_id': ..., 'token': ...}
+        """
+        url = self.base_url + "user/token"
+        master_token = self.get_master_token()
+        custom_headers = {
+            'accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Connection': 'close',
+            'Authorization': f'Bearer {master_token}'
+        }
+        payload = {"username": username, "tenant_id": tenant_id}
+        resp = self._api_request('POST', url, data=payload, headers=custom_headers)
+        if resp.status_code in [200, 201]:
+            return resp.json()
+        else:
+            raise AirflowException(
+                f"Failed to create user token. Status: {resp.status_code}, Body: {resp.text}")
+
+    def delete_user_token(self, token_id: str):
+        """
+        Delete user token using the generated user token (from session auth)
+        DELETE /api/v1/user/token/{token_id}
+        """
+        url = self.base_url + f"user/token/{token_id}"
+        resp = self._api_request('DELETE', url, skip_retry=True)
+        if resp.status_code not in [200, 201, 204]:
+            self.log.warning(
+                f"Failed to delete user token. Status: {resp.status_code}, Body: {resp.text}")
+        
+    def get_workspace_details(self, workspace_id: int) -> dict:
+        """
+        Fetch workspace details to get tenant_id
+        GET /api/v1/workspace?workspace_id={workspace_id}
+        Returns: {'tenant_id': ..., ...}
+        """
+        self.log.debug(f"Fetching details for workspace {workspace_id}")
+        url = self.base_url + "workspace"
+        self.log.debug(f"Workspace details URL: {url}")
+        params = {"workspace_id": workspace_id}
+        self.log.debug(f"Workspace details params: {params}")
+        master_token = self.get_master_token()
+        custom_headers = {
+            'accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Connection': 'close',
+            'Authorization': f'Bearer {master_token}'
+        }
+        resp = self._api_request('GET', url, params=params, headers=custom_headers)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            raise AirflowException(
+                f"Failed to fetch workspace details. Status: {resp.status_code}, Body: {resp.text}")
+        
+    def _get_username_dagid_from_context(self, context):
+        dag = context.get('dag')
+        dag_run = context.get('dag_run')
+        
+        # Try runtime config first
+        username = dag_run.conf.get('owner') if dag_run else None
+        
+        # Fallback to default_args
+        if not username:
+            username = dag.default_args.get('owner') if dag else None
+            
+        dag_id = dag.dag_id if dag else None
+
+        return username, dag_id
