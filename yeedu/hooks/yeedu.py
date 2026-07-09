@@ -390,7 +390,8 @@ class YeeduHook(BaseHook):
     def submit_job(self, job_id: str, task_cluster_id: int = None, is_background: bool = True, 
                    arguments: str = None, conf: List[str] = None, 
                    task_name: str = None, dag_id: str = None, dag_run_id: str = None, 
-                   task_instance_id: str = None, try_number: int = None) -> int:
+                   task_instance_id: str = None, try_number: int = None,
+                   map_index: int = None) -> int:
         """
         Submits a job to Yeedu.
 
@@ -431,6 +432,19 @@ class YeeduHook(BaseHook):
                 data['task_instance_id'] = task_instance_id
             if try_number is not None:
                 data['try_number'] = try_number
+            if map_index is None:
+                map_index = -1
+            data['map_index'] = map_index
+
+            self.log.info(
+                "submit_job payload: job_id=%s dag_id=%s dag_run_id=%s task_name=%s try_number=%s map_index=%s",
+                data.get('job_id'),
+                data.get('dag_id'),
+                data.get('dag_run_id'),
+                data.get('task_name'),
+                data.get('try_number'),
+                data.get('map_index'),
+            )
 
             response = self._api_request('POST', job_url, data)
             api_status_code = response.status_code
@@ -750,3 +764,289 @@ class YeeduHook(BaseHook):
         dag_id = dag.dag_id if dag else None
 
         return username, dag_id
+
+    # -------------------------------------------------------------------------
+    # Phase 4 — Pipeline cluster promotion helpers
+    # -------------------------------------------------------------------------
+
+    def get_pipeline(self, workspace_id: int, pipeline_id: int) -> dict:
+        """Fetch the current pipeline spec (GET /workspace/{workspace_id}/pipeline/{pipeline_id})."""
+        url = self.base_url + f"workspace/{workspace_id}/pipeline/{pipeline_id}"
+        resp = self._api_request('GET', url)
+        if resp.status_code == 200:
+            return resp.json()
+        raise AirflowException(
+            f"Failed to GET pipeline {pipeline_id}. Status: {resp.status_code}, Body: {resp.text}")
+
+    def update_pipeline(self, workspace_id: int, pipeline_id: int, edit_pipeline_body: dict) -> dict:
+        """Update the pipeline spec (PUT /workspace/{workspace_id}/pipeline/{pipeline_id})."""
+        url = self.base_url + f"workspace/{workspace_id}/pipeline/{pipeline_id}"
+        resp = self._api_request('PUT', url, data=edit_pipeline_body)
+        if resp.status_code in [200, 201]:
+            return resp.json()
+        raise AirflowException(
+            f"Failed to PUT pipeline {pipeline_id}. Status: {resp.status_code}, Body: {resp.text}")
+
+    # Task types that can hold a task_cluster_id / cluster_ids.
+    # condition_task, switch_case_task, for_each_task, sleep_task, run_job_task
+    # are CLUSTER_ID_RESTRICTED in the REST API and therefore cannot be
+    # promotion targets. Only these five types can ever trigger cluster bumps.
+    _PROMOTABLE_TASK_TYPES = {
+        'notebook_task', 'spark_jar_task', 'spark_python_task',
+        'spark_scala_task', 'sql_task',
+    }
+
+    @staticmethod
+    def _rebuild_email_notifications(notifications_list, has_on_start=False):
+        """
+        Convert the GET pipeline_notifications / task_notifications array format
+        into the PUT email_notifications dict format.
+
+        GET shape  : [{emails: [...], notification_event_type: {name: "On Success"}}, ...]
+        PUT shape  : {on_success: [...], on_failure: [...]}   (pipeline-level)
+                     {on_start: [...], on_success: [...], on_failure: [...]} (task-level)
+        """
+        result = {}
+        for notif in (notifications_list or []):
+            event_name = (notif.get('notification_event_type') or {}).get('name', '')
+            emails = notif.get('emails') or []
+            if not emails:
+                continue
+            if event_name == 'On Start' and has_on_start:
+                result['on_start'] = emails
+            elif event_name == 'On Success':
+                result['on_success'] = emails
+            elif event_name == 'On Failure':
+                result['on_failure'] = emails
+        return result or None
+
+    @staticmethod
+    def _strip_pipeline_params(task_params: dict, pipeline_params: dict) -> dict:
+        """
+        Return only the task-specific subset of task_params.
+
+        Airflow automatically merges DAG-level params (pipeline.params) into every
+        task's params at DAG load time, so the GET response's task.parameters
+        contains the full merged set.  Before writing them back in a PUT body we
+        strip any key whose value is *identical* to the pipeline-level value —
+        those came from the merge, not from the original task definition.
+
+        Keys where the task intentionally overrides a pipeline param with a
+        *different* value (e.g. a Jinja template string like
+        ``{{ job.parameters.env }}``) are preserved.
+        """
+        if not task_params or not pipeline_params:
+            return task_params
+        return {k: v for k, v in task_params.items()
+                if k not in pipeline_params or pipeline_params[k] != v}
+
+    def _build_edit_pipeline_from_get_response(self, pipeline_response: dict) -> dict:
+        """
+        Convert the GET /pipeline/{id} response shape into the PUT request body shape.
+
+        The GET response uses nested objects (task_cluster, task_run_condition,
+        spark_job_id, pipeline_notifications, task_notifications); the PUT body
+        uses flat fields (task_cluster_id, run_if, job_id, email_notifications).
+
+        Fields injected into the GET response by the service layer (from Airflow):
+          - Pipeline: schedule_cron, is_paused, max_active_runs, tags, params
+          - Task / for-each inner task: retries, retry_delay, parameters
+        All of these are round-tripped correctly.
+
+        Pipeline-level fields stored in the DB and returned directly from GET:
+          - default_start_date, end_date
+
+        Task parameters in the GET response are the Airflow-merged set
+        (pipeline.params + task-specific params, task wins on conflict).
+        _strip_pipeline_params() restores the original task-specific-only subset
+        before the PUT body is sent, preventing pipeline-param drift on promotions.
+        """
+        pipeline = pipeline_response.get('pipeline', {})
+        tasks = pipeline_response.get('tasks', []) or []
+        pipeline_params = pipeline.get('params') or {}
+
+        edit_tasks = []
+        for task in tasks:
+            task_cluster = task.get('task_cluster') or {}
+            depends_on_raw = task.get('depends_on') or []
+
+            raw_params = task.get('parameters') or {}
+            task_specific_params = self._strip_pipeline_params(raw_params, pipeline_params) or None
+
+            edit_task = {
+                'task_key': task['name'],
+                'run_if': (task.get('task_run_condition') or {}).get('name'),
+                'task_cluster_id': task_cluster.get('cluster_id'),
+                'cluster_ids': task.get('cluster_ids'),
+                # retries / retry_delay / parameters are injected into the GET
+                # response by the service layer from Airflow DAG task data.
+                'retries': task.get('retries'),
+                'retry_delay': task.get('retry_delay'),
+                'parameters': task_specific_params,
+                'depends_on': [
+                    ({'task_key': d['task_name']} if d.get('outcome') is None
+                     else {'task_key': d['task_name'], 'outcome': d['outcome']})
+                    for d in depends_on_raw if d.get('task_name')
+                ],
+            }
+
+            # Reconstruct task-level email_notifications from task_notifications
+            # (stored in pipeline_task_notification table, returned per-task in GET)
+            task_email = self._rebuild_email_notifications(
+                task.get('task_notifications'), has_on_start=True)
+            if task_email:
+                edit_task['email_notifications'] = task_email
+
+            # Map job-based task type sub-objects (GET uses spark_job_id, PUT uses job_id)
+            for t_type in ['notebook_task', 'spark_jar_task', 'spark_python_task',
+                           'spark_scala_task', 'sql_task']:
+                sub = task.get(t_type)
+                if sub and sub.get('spark_job_id'):
+                    edit_task[t_type] = {'job_id': sub['spark_job_id']}
+
+            run_job = task.get('run_job_task')
+            if run_job and run_job.get('pipeline_id'):
+                edit_task['run_job_task'] = {'pipeline_id': run_job['pipeline_id']}
+
+            # Pass control-flow task metadata through as-is (same shape in GET and PUT)
+            for t_type in ['condition_task', 'switch_case_task', 'sleep_task']:
+                if task.get(t_type) is not None:
+                    edit_task[t_type] = task[t_type]
+
+            fe = task.get('for_each_task')
+            if fe:
+                inner = fe.get('task') or {}
+                inner_cluster = (inner.get('task_cluster') or {}).get('cluster_id')
+                inner_sub = {}
+                # Job-type inner tasks (GET spark_job_id → PUT job_id)
+                for t_type in ['notebook_task', 'spark_jar_task', 'spark_python_task',
+                               'spark_scala_task', 'sql_task']:
+                    sub = inner.get(t_type)
+                    if sub and sub.get('spark_job_id'):
+                        inner_sub[t_type] = {'job_id': sub['spark_job_id']}
+                # Nested pipeline inside for_each (run_job_task — allowed in for_each)
+                inner_run_job = inner.get('run_job_task')
+                if inner_run_job and inner_run_job.get('pipeline_id'):
+                    inner_sub['run_job_task'] = {'pipeline_id': inner_run_job['pipeline_id']}
+                # sleep_task is allowed inside for_each; condition_task is restricted
+                # but the GET SQL includes it defensively for legacy data — pass through
+                for t_type in ['sleep_task', 'condition_task']:
+                    if inner.get(t_type) is not None:
+                        inner_sub[t_type] = inner[t_type]
+                raw_inner_params = inner.get('parameters') or {}
+                inner_specific_params = self._strip_pipeline_params(raw_inner_params, pipeline_params) or None
+                inner_task_dict = {
+                    'task_key': inner.get('name'),
+                    'task_cluster_id': inner_cluster,
+                    'cluster_ids': inner.get('cluster_ids'),
+                    # retries / retry_delay / parameters injected from Airflow by service
+                    'retries': inner.get('retries'),
+                    'retry_delay': inner.get('retry_delay'),
+                    'parameters': inner_specific_params,
+                    **inner_sub,
+                }
+                # Reconstruct inner task email_notifications from task_notifications
+                inner_task_email = self._rebuild_email_notifications(
+                    inner.get('task_notifications'), has_on_start=True)
+                if inner_task_email:
+                    inner_task_dict['email_notifications'] = inner_task_email
+                # Strip None values from inner task
+                inner_task_dict = {k: v for k, v in inner_task_dict.items() if v is not None}
+                edit_task['for_each_task'] = {
+                    'inputs': fe.get('inputs'),
+                    'concurrency': fe.get('concurrency'),
+                    'task': inner_task_dict,
+                }
+
+            # Strip None values — PUT body treats missing fields as "no change"
+            edit_task = {k: v for k, v in edit_task.items() if v is not None}
+            edit_tasks.append(edit_task)
+
+        edit_pipeline = {
+            'name': pipeline.get('name'),
+            'tasks': edit_tasks,
+        }
+
+        # description is in the pipeline DB table — round-trip it
+        if pipeline.get('description') is not None:
+            edit_pipeline['description'] = pipeline['description']
+
+        # These are injected by the service from Airflow DAG details — round-trip them
+        for field in ['schedule_cron', 'is_paused', 'max_active_runs', 'tags', 'params', 'default_start_date', 'end_date']:
+            val = pipeline.get(field)
+            if val is not None:
+                edit_pipeline[field] = val
+
+        # Reconstruct pipeline-level email_notifications from pipeline_notifications
+        # (stored in pipeline_notification table, returned at top level in GET)
+        pipeline_email = self._rebuild_email_notifications(
+            pipeline_response.get('pipeline_notifications'), has_on_start=False)
+        if pipeline_email:
+            edit_pipeline['email_notifications'] = pipeline_email
+
+        return edit_pipeline
+
+    def promote_pipeline_task_cluster(self, workspace_id: int, pipeline_id: int,
+                                      task_key: str, successful_cluster_id: int,
+                                      clusters_tried: list):
+        """
+        After a successful cluster bump in a pipeline run, persist the working cluster
+        to the pipeline task so future runs start directly on it.
+
+        clusters_tried: all clusters attempted up to and including the successful one.
+        All are removed from cluster_ids. The successful one becomes task_cluster_id.
+
+        Example: cluster_ids=[1,2,3,4], success on 3, clusters_tried=[1,2,3]
+        Result:  task_cluster_id=3, cluster_ids=[4]
+        """
+        self.log.info(
+            f"Promoting cluster {successful_cluster_id} to task_cluster_id "
+            f"for task '{task_key}' in pipeline {pipeline_id}. "
+            f"Clusters tried (to be removed): {clusters_tried}")
+
+        # Step 1: GET current pipeline spec
+        pipeline_response = self.get_pipeline(workspace_id, pipeline_id)
+
+        # Step 2: Find target task and apply promotion
+        tasks = pipeline_response.get('tasks') or []
+        task_found = False
+        tried_set = set(clusters_tried)
+
+        for task in tasks:
+            if task.get('name') == task_key:
+                # Only promotable task types can have task_cluster_id / cluster_ids.
+                # condition_task, switch_case_task, for_each_task, sleep_task and
+                # run_job_task are CLUSTER_ID_RESTRICTED in the API and can never
+                # trigger cluster bumps — skip silently if we encounter one.
+                task_type_info = task.get('pipeline_task_type') or {}
+                task_type_name = task_type_info.get('name', '')
+                promotable_type_names = {
+                    'Notebook', 'Jar', 'Python', 'Scala', 'SQL',
+                }
+                if task_type_name and task_type_name not in promotable_type_names:
+                    self.log.warning(
+                        f"Task '{task_key}' has type '{task_type_name}' which cannot "
+                        f"have a cluster assignment — skipping promotion")
+                    return
+
+                task['task_cluster'] = {'cluster_id': successful_cluster_id}
+                old_cluster_ids = task.get('cluster_ids') or []
+                task['cluster_ids'] = [cid for cid in old_cluster_ids if cid not in tried_set]
+                task_found = True
+                self.log.info(
+                    f"Task '{task_key}': task_cluster_id={successful_cluster_id}, "
+                    f"remaining cluster_ids={task['cluster_ids']}")
+                break
+
+        if not task_found:
+            self.log.warning(
+                f"Task '{task_key}' not found in pipeline {pipeline_id} — skipping promotion")
+            return
+
+        # Step 3: Rebuild EditPipeline body from updated GET response
+        edit_pipeline_body = self._build_edit_pipeline_from_get_response(pipeline_response)
+
+        # Step 4: PUT pipeline — updates DB and regenerates DAG file atomically
+        self.update_pipeline(workspace_id, pipeline_id, edit_pipeline_body)
+        self.log.info(
+            f"Cluster promotion complete for task '{task_key}' in pipeline {pipeline_id}")

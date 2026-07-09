@@ -161,8 +161,12 @@ class YeeduNotebookRunOperator:
             self.log.info(
                 f"Bumping to cluster {new_cluster_id} (index {self.current_cluster_index})")
 
-            # Update notebook cluster configuration
-            self.hook.update_notebook_cluster(self.notebook_id, new_cluster_id)
+            # For standalone DAGs: persist working cluster to notebook record for cross-run memory
+            # For pipeline DAGs: Cluster Promotion handles persistence safely
+            if not self.use_master_token_flow:
+                self.log.info(
+                    f"Persisting cluster {new_cluster_id} to notebook {self.notebook_id} record for future standalone runs")
+                self.hook.update_notebook_cluster(self.notebook_id, new_cluster_id)
 
             # Reset state for new run - DON'T create notebook here, main loop will handle it
             self.should_bump_cluster = False
@@ -181,8 +185,11 @@ class YeeduNotebookRunOperator:
                 "notebook_id": self.notebook_id,
                 "is_background": True
             }
-            if self.task_cluster_id is not None:
+            if self.cluster_ids and self.current_cluster_index >= 0:
+                data['cluster_id'] = self.cluster_ids[self.current_cluster_index]
+            elif self.task_cluster_id is not None:
                 data['cluster_id'] = self.task_cluster_id
+            # else: no override — notebook runs on its configured default cluster
             if self.arguments:
                 data['arguments'] = self.arguments
             if self.conf:
@@ -197,6 +204,18 @@ class YeeduNotebookRunOperator:
                     data['dag_run_id'] = ti.run_id
                     data['task_instance_id'] = str(ti.id) if ti.id else None  # Convert UUID to string
                     data['try_number'] = ti.try_number
+                    map_index = getattr(ti, "map_index", -1)
+                    data['map_index'] = -1 if map_index is None else map_index
+
+            self.log.info(
+                "create_notebook_instance payload: notebook_id=%s dag_id=%s dag_run_id=%s task_name=%s try_number=%s map_index=%s",
+                data.get('notebook_id'),
+                data.get('dag_id'),
+                data.get('dag_run_id'),
+                data.get('task_name'),
+                data.get('try_number'),
+                data.get('map_index'),
+            )
                     
             post_url = self.base_url + \
                 f'workspace/{self.workspace_id}/notebook/run'
@@ -1309,6 +1328,9 @@ class YeeduNotebookRunOperator:
                 self.hook.set_headers({'Authorization': f'Bearer {user_token}'})
                 self.hook.session.headers.update(self.hook.get_headers())
 
+            # Store for use in _update_cluster_and_restart() and promotion logic
+            self.use_master_token_flow = use_master_token_flow
+
             # Initialize cluster usage if cluster_ids provided
             if self.cluster_ids:
                 self.log.info(
@@ -1324,8 +1346,11 @@ class YeeduNotebookRunOperator:
                         current_cluster_id = self.cluster_ids[self.current_cluster_index]
                         self.log.info(
                             f"Cluster bump attempt {self.current_cluster_index + 1}/{len(self.cluster_ids)}: executing notebook on cluster {current_cluster_id}")
-                        self.hook.update_notebook_cluster(
-                            self.notebook_id, current_cluster_id)
+                        # For standalone DAGs: persist working cluster to notebook record for cross-run memory
+                        # For pipeline DAGs: cluster promotion handles persistence safely
+                        if not self.use_master_token_flow:
+                            self.hook.update_notebook_cluster(
+                                self.notebook_id, current_cluster_id)
                     elif self.cluster_ids:
                         self.log.info(
                             "Executing notebook on its existing cluster configuration")
@@ -1457,6 +1482,21 @@ class YeeduNotebookRunOperator:
 
                     # If execution was successful, stop the cluster bumping loop
                     if self.notebook_executed:
+                        if self.use_master_token_flow and self.current_cluster_index >= 0 and self.cluster_ids:
+                            bumped_cluster_id = self.cluster_ids[self.current_cluster_index]
+                            dag_id_str = context.get('ti') and context['ti'].dag_id
+                            parts = dag_id_str.split("_") if dag_id_str else []
+                            pipeline_id = int(parts[1]) if len(parts) >= 2 else None
+                            task_key = context['ti'].task_id if context.get('ti') else None
+                            if pipeline_id and task_key:
+                                clusters_tried = self.cluster_ids[:self.current_cluster_index + 1]
+                                try:
+                                    self.hook.promote_pipeline_task_cluster(
+                                        self.workspace_id, pipeline_id, task_key,
+                                        bumped_cluster_id, clusters_tried)
+                                except Exception as promote_err:
+                                    self.log.warning(
+                                        f"Cluster promotion failed (non-fatal, notebook succeeded): {promote_err}")
                         time.sleep(5)
                         self.stop_notebook()
                         return 0
@@ -1509,6 +1549,15 @@ class YeeduNotebookRunOperator:
                         if self._update_cluster_and_restart():
                             self.log.info(
                                 "Cluster bump applied after exception, retrying execution")
+                            self.cluster_bumped_successfully = False
+                            # Reset execution state for a clean start on the next cluster
+                            self.notebook_executed = True
+                            self.error_name = None
+                            self.error_value = None
+                            self.cell_output_data = []
+                            self.execution_times = {}
+                            self.notebook_cells = {}
+                            self.notebook_json = {}
                             continue
 
                     # Re-raise if no cluster bump available or bump failed

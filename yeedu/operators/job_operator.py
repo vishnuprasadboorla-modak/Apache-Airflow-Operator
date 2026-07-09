@@ -92,7 +92,7 @@ class YeeduJobRunOperator:
                 f"Failed log analysis for cluster bump decision: {e}")
             return False
 
-    def run_job(self, cluster_id=None, context=None) -> tuple:
+    def run_job(self, cluster_id=None, context=None, use_master_token_flow=False) -> tuple:
         """
         Runs a job on a specified cluster and handles the complete job lifecycle.
 
@@ -113,10 +113,11 @@ class YeeduJobRunOperator:
         exception = None
 
         try:
-            # Update cluster binding if specified
-            if cluster_id is not None:
+            # For standalone DAGs: persist working cluster to job record for cross-run memory
+            # For pipeline DAGs: cluster promotion handles persistence safely
+            if cluster_id is not None and not use_master_token_flow:
                 self.log.info(
-                    f"Binding job {self.job_id} to cluster {cluster_id}")
+                    f"Persisting cluster {cluster_id} to job {self.job_id} record for future standalone runs")
                 self.hook.update_job_cluster(
                     job_id=self.job_id, cluster_id=int(cluster_id))
 
@@ -126,6 +127,7 @@ class YeeduJobRunOperator:
             dag_run_id = None
             task_instance_id = None
             try_number = None
+            map_index = -1
             
             if context:
                 ti = context.get('ti')
@@ -135,11 +137,20 @@ class YeeduJobRunOperator:
                     dag_run_id = ti.run_id
                     task_instance_id = str(ti.id) if ti.id else None  # Convert UUID to string
                     try_number = ti.try_number
+                    map_index = ti.map_index
+                    self.log.info(
+                        "Pipeline context for submit_job: task_id=%s dag_id=%s run_id=%s try_number=%s map_index=%s",
+                        task_name,
+                        dag_id,
+                        dag_run_id,
+                        try_number,
+                        map_index,
+                    )
 
             self.log.info(f"Submitting job {self.job_id}")
             run_id = self.hook.submit_job(
                 job_id=self.job_id,
-                task_cluster_id=self.task_cluster_id,
+                task_cluster_id=cluster_id if cluster_id is not None else self.task_cluster_id,
                 is_background=True,
                 arguments=self.arguments,
                 conf=self.conf,
@@ -147,7 +158,8 @@ class YeeduJobRunOperator:
                 dag_id=dag_id,
                 dag_run_id=dag_run_id,
                 task_instance_id=task_instance_id,
-                try_number=try_number
+                try_number=try_number,
+                map_index=map_index
             )
 
             # Store the run_id for templating and later use
@@ -269,7 +281,7 @@ class YeeduJobRunOperator:
             self.log.info(
                 f"Running job {self.job_id} on the existing cluster configuration"
             )
-            success, run_id, job_status, exception = self.run_job(context=context)
+            success, run_id, job_status, exception = self.run_job(context=context, use_master_token_flow=use_master_token_flow)
 
             # If job succeeded, we're done
             if success:
@@ -311,13 +323,27 @@ class YeeduJobRunOperator:
 
                 # Run job on this cluster
                 success, run_id, job_status, exception = self.run_job(
-                    cluster_id)
+                    cluster_id, context=context, use_master_token_flow=use_master_token_flow)
 
                 # If job succeeded, we're done
                 if success:
                     self.log.info(
                         f"Job {self.job_id} completed successfully after cluster bump to cluster {cluster_id}"
                     )
+                    if use_master_token_flow and context:
+                        dag_id_str = context.get('ti') and context['ti'].dag_id
+                        parts = dag_id_str.split("_") if dag_id_str else []
+                        pipeline_id = int(parts[1]) if len(parts) == 2 else None
+                        task_key = context['ti'].task_id if context.get('ti') else None
+                        if pipeline_id and task_key:
+                            clusters_tried = available_clusters[:attempt]
+                            try:
+                                self.hook.promote_pipeline_task_cluster(
+                                    self.workspace_id, pipeline_id, task_key,
+                                    cluster_id, clusters_tried)
+                            except Exception as promote_err:
+                                self.log.warning(
+                                    f"Cluster promotion failed (non-fatal, job succeeded): {promote_err}")
                     return
 
                 # Check if we should continue bumping

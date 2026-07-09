@@ -221,6 +221,47 @@ def _eval_workspace_token(token: str, ws_meta: Dict[str, Any]) -> Any:
         return ws_meta["url"]
     return None
 
+def evaluate_condition(left: str, operator: str, right: str) -> bool:
+    """
+    Evaluate a comparison between two string values using the given operator.
+
+    Numeric operators (GT, LT, GE, LE) attempt to coerce both sides to float;
+    if coercion fails they return False.  Equality operators do string comparison.
+
+    Supported operators (case-insensitive aliases):
+        EQUAL_TO / EQ, NOT_EQUAL / NE, GREATER_THAN / GT,
+        LESS_THAN / LT, GREATER_THAN_OR_EQUAL / GE, LESS_THAN_OR_EQUAL / LE
+    """
+    op = operator.upper()
+    _EQ = {"EQUAL_TO", "EQ"}
+    _NE = {"NOT_EQUAL", "NE"}
+    _GT = {"GREATER_THAN", "GT"}
+    _LT = {"LESS_THAN", "LT"}
+    _GE = {"GREATER_THAN_OR_EQUAL", "GE"}
+    _LE = {"LESS_THAN_OR_EQUAL", "LE"}
+
+    if op in _EQ:
+        return str(left) == str(right)
+    if op in _NE:
+        return str(left) != str(right)
+
+    try:
+        l_num, r_num = float(left), float(right)
+    except (TypeError, ValueError):
+        return False
+
+    if op in _GT:
+        return l_num > r_num
+    if op in _LT:
+        return l_num < r_num
+    if op in _GE:
+        return l_num >= r_num
+    if op in _LE:
+        return l_num <= r_num
+
+    return False
+
+
 def resolve_all_task_params(
     params: Dict[str, Any],
     context: Dict[str, Any],
