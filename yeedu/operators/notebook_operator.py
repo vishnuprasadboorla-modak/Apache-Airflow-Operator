@@ -355,7 +355,12 @@ class YeeduNotebookRunOperator:
     def get_websocket_token(self):
         try:
             # Use the hook's headers instead of importing from module level
-            token = self.hook.get_headers().get("Authorization").split(" ")[1]
+            auth_header = self.hook.get_headers().get("Authorization") or ""
+            auth_parts = auth_header.split(" ")
+            if len(auth_parts) < 2 or not auth_parts[1]:
+                raise ValueError(
+                    "Authorization header is missing or malformed")
+            token = auth_parts[1]
             proxy_url = (
                 self.base_url
                 + f"workspace/{self.workspace_id}/notebook/run/{self.run_id}/kernel/ws"
@@ -1486,7 +1491,7 @@ class YeeduNotebookRunOperator:
                             bumped_cluster_id = self.cluster_ids[self.current_cluster_index]
                             dag_id_str = context.get('ti') and context['ti'].dag_id
                             parts = dag_id_str.split("_") if dag_id_str else []
-                            pipeline_id = int(parts[1]) if len(parts) >= 2 else None
+                            pipeline_id = int(parts[1]) if len(parts) == 2 else None
                             task_key = context['ti'].task_id if context.get('ti') else None
                             if pipeline_id and task_key:
                                 clusters_tried = self.cluster_ids[:self.current_cluster_index + 1]

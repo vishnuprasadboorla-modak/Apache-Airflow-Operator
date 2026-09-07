@@ -354,6 +354,18 @@ def resolve_foreach_input(
     """
     import json
 
+    # expr may already be a list/None when the param default is real JSON;
+    # only a string needs stripping and token/JSON handling below.
+    if expr is None:
+        log.info("[resolve_foreach_input] INPUT is None -> []")
+        return []
+    if isinstance(expr, (list, tuple)):
+        log.info("[resolve_foreach_input] INPUT already a sequence: %r", expr)
+        return list(expr)
+    if not isinstance(expr, str):
+        log.info("[resolve_foreach_input] INPUT non-string scalar: %r -> [%r]", expr, expr)
+        return [expr]
+
     expr = expr.strip()
     log.info("[resolve_foreach_input] INPUT: expr=%r", expr)
 
@@ -425,12 +437,18 @@ def _parse_foreach_value(value: Any) -> list:
     """Parse a parameter value into a list for for_each expansion."""
     import json
 
-    try:
-        parsed = json.loads(str(value))
-        if isinstance(parsed, list):
-            return parsed
-    except (json.JSONDecodeError, TypeError):
-        pass
+    # A sequence is already the result; re-parsing it would nest it in a list.
+    if isinstance(value, (list, tuple)):
+        return list(value)
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     # Non-list value → wrap in list
     return [value]
 
