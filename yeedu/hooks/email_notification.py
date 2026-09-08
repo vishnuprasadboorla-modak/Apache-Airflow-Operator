@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import msal
 import requests
 from airflow.hooks.base import BaseHook
@@ -75,6 +77,20 @@ class EmailNotificationHook(BaseHook):
             )
         self.log.info(f"Sent email to {recipients} with subject '{subject}'")
 
+    @staticmethod
+    def _attempt_text(context) -> str | None:
+        """Return "<try> of <total>" (or just "<try>") from the task context."""
+        ti = context.get("task_instance") if context else None
+        if ti is None:
+            return None
+        try_number = getattr(ti, "try_number", None)
+        if try_number is None:
+            return None
+        max_tries = getattr(ti, "max_tries", None)
+        if max_tries is None:
+            return str(try_number)
+        return f"{try_number} of {max_tries + 1}"
+
     def _generate_html(
         self, identifier: str, run_id: str, status: str, is_dag=False, context=None, extra_info=None
     ) -> str:
@@ -82,26 +98,35 @@ class EmailNotificationHook(BaseHook):
         Build a styled HTML email body.
         When is_dag=True the identifier is a DAG id, otherwise a task id.
         """
-        status_msg = "SUCCESS" if status.lower() == "success" else "FAILED"
         heading = "Airflow DAG Notification" if is_dag else "Airflow Task Notification"
-        name_label = "DAG Name" if is_dag else "Task ID"
+        name_label = "DAG ID" if is_dag else "Task ID"
         url = re.search(r'(https?://\S+)', extra_info).group(1) if extra_info and re.search(r'(https?://\S+)', extra_info) else None
 
-
-        # Pick text color in Python
-        if status_msg.lower() == "success":
-            status_color = "#28a745"  # green
-        elif status_msg.lower() == "failed":
-            status_color = "#dc3545"  # red
-        elif status_msg.lower() == "running":
-            status_color = "#007bff"  # blue
+        # Map the raw status to a display label + color
+        s = status.lower()
+        if s == "success":
+            status_msg, status_color = "SUCCESS", "#28a745"  # green
+        elif s in ("failed", "failure", "error"):
+            status_msg, status_color = "FAILED", "#dc3545"  # red
+        elif s in ("started", "running"):
+            status_msg, status_color = "STARTED", "#007bff"  # blue
         else:
-            status_color = "#6c757d"  # grey
+            status_msg, status_color = status.upper(), "#6c757d"  # grey
 
         rows = []
         rows.append(
             f"<tr><td style='padding:10px;font-weight:bold;width:30%'>{name_label}</td><td>{identifier}</td></tr>"
         )
+
+        # DAG display name, right under the DAG ID (only when set and different)
+        if is_dag and context:
+            _dag = context.get("dag")
+            _display_name = getattr(_dag, "dag_display_name", None) if _dag else None
+            if _display_name and _display_name != identifier:
+                rows.append(
+                    f"<tr><td style='padding:10px;font-weight:bold;'>DAG Name</td><td>{_display_name}</td></tr>"
+                )
+
         rows.append(
             f"<tr><td style='padding:10px;font-weight:bold;'>Run ID</td><td>{run_id}</td></tr>"
         )
@@ -155,6 +180,12 @@ class EmailNotificationHook(BaseHook):
             ti = context.get("task_instance")
             dag = context.get("dag")
 
+            dag_id = getattr(dag, "dag_id", None) if dag else None
+            # dag_display_name falls back to dag_id in Airflow; only show it when set explicitly
+            display_name = getattr(dag, "dag_display_name", None) if dag else None
+            if display_name == dag_id:
+                display_name = None
+
             execution_date = str(
                 context.get("logical_date") or context.get("execution_date")
             )
@@ -168,6 +199,23 @@ class EmailNotificationHook(BaseHook):
                 if ti and ti.start_date and ti.end_date
                 else None
             )
+
+            attempt_txt = self._attempt_text(context)
+            if attempt_txt and getattr(ti, "try_number", 1) > 1:
+                attempt_txt += " (retry)"
+
+            if dag_id:
+                rows.append(
+                    f"<tr><td style='padding:10px;font-weight:bold;'>DAG ID</td><td>{dag_id}</td></tr>"
+                )
+            if display_name:
+                rows.append(
+                    f"<tr><td style='padding:10px;font-weight:bold;'>DAG Name</td><td>{display_name}</td></tr>"
+                )
+            if attempt_txt:
+                rows.append(
+                    f"<tr><td style='padding:10px;font-weight:bold;'>Attempt</td><td>{attempt_txt}</td></tr>"
+                )
 
             if execution_date:
                 rows.append(
@@ -213,6 +261,9 @@ class EmailNotificationHook(BaseHook):
         if not recipients: 
             return None
         subject = f"Airflow Task {task_id} {status.capitalize()}"
+        attempt_txt = self._attempt_text(context)
+        if attempt_txt:
+            subject += f" (attempt {attempt_txt})"
         body = self._generate_html(
             task_id, run_id, status, is_dag=False, context=context, extra_info=extra_info
         )
