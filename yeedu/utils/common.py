@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import timedelta
@@ -52,9 +53,36 @@ def retry_delay_from_milliseconds(milliseconds: int | None) -> timedelta:
 
 # Runtime expression resolver
 _RUNTIME_TOKEN_RE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+_MAX_EXPR_DEPTH = 5
 
 
-def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None) -> Any:
+def _unwrap_xcom_value(val: Any) -> Any:
+    """
+    Undo one layer of JSON encoding on a string XCom value; non-strings and non-JSON text pass through.
+    A value set with dbutils.jobs.taskValues.set() is encoded twice (dbutils client + Airflow REST create),
+    so this is applied twice by the caller (mirrors unwrapXComValue in the REST API's widgetExprResolver.js).
+    """
+    if not isinstance(val, str):
+        return val
+    try:
+        parsed = json.loads(val)
+    except ValueError:
+        return val
+    return parsed if isinstance(parsed, str) else json.dumps(parsed, separators=(",", ":"))
+
+
+def _current_task_params(context: Dict[str, Any]) -> Dict[str, Any]:
+    """The current task's own params ({{ task.params.<key> }}); empty if unavailable."""
+    ti = (context or {}).get("ti")
+    task = getattr(ti, "task", None)
+    try:
+        return dict(getattr(task, "params", None) or {})
+    except Exception as e:
+        log.warning("[resolve_expr] could not read task params: %s", e)
+        return {}
+
+
+def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None, _depth: int = 0) -> Any:
     """
     Resolve runtime expressions in strings.
 
@@ -66,6 +94,7 @@ def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None) -> Any:
     Args:
         expr: The expression to resolve (can be any type, only strings are processed)
         context: The Airflow task context dictionary
+        _depth: Internal recursion depth for templates nested inside parameter values
 
     Returns:
         The resolved expression or the original value if not a string
@@ -86,18 +115,30 @@ def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None) -> Any:
     job_params = get_job_parameters(context)
     cur_task_meta = get_current_task_meta(context)
 
+    def _resolve_nested(val: Any) -> Any:
+        """A parameter value may itself contain {{ ... }} — resolve it (bounded depth)."""
+        if isinstance(val, str) and _RUNTIME_TOKEN_RE.search(val) and _depth < _MAX_EXPR_DEPTH:
+            return resolve_runtime_expr(val, context, _depth + 1)
+        return val
+
     def _eval_token(token: str) -> Any:
         token = token.strip()
 
         if token.startswith("job.parameters."):
             key = token.split(".", 2)[2]
-            val = job_params.get(key)
+            val = _resolve_nested(job_params.get(key))
             log.info("[resolve_expr]   token=%r → job_params[%r] = %r (type=%s)", token, key, val, type(val).__name__)
             return val
 
         if token.startswith("job."):
             val = _eval_job_token(token, job_meta)
             log.info("[resolve_expr]   token=%r → %r (type=%s)", token, val, type(val).__name__)
+            return val
+
+        if token.startswith("task.params."):
+            key = token.split(".", 2)[2]
+            val = _resolve_nested(_current_task_params(context).get(key))
+            log.info("[resolve_expr]   token=%r → task_params[%r] = %r (type=%s)", token, key, val, type(val).__name__)
             return val
 
         if token.startswith("task."):
@@ -178,12 +219,12 @@ def _eval_other_task_token(token: str, context: Dict[str, Any]) -> Any:
     Evaluate tokens for other tasks.
 
     Supported patterns:
-      tasks.<name>.values.<key>    → XCom pull (set by dbutils.taskValues.set)
-      tasks.<name>.result_state    → Airflow task instance state
-      tasks.<name>.run_id          → Airflow task instance run_id
-      tasks.<name>.execution_count → Airflow task instance try_number
+      tasks.<name>.values.<key>    → XCom pull (set by dbutils.taskValues.set), JSON layers decoded
+      tasks.<name>.result_state    → state of that task in this dag run
+      tasks.<name>.run_id          → task instance id (UUID) — Yeedu job/notebook tasks only
+      tasks.<name>.execution_count → try number — Yeedu job/notebook tasks only
     """
-    from .metadata import get_other_task_instance
+    from .metadata import get_other_task_info
 
     parts = token.split(".")
 
@@ -193,21 +234,15 @@ def _eval_other_task_token(token: str, context: Dict[str, Any]) -> Any:
         if field == "values":
             ti = context.get("ti")
             if ti:
-                return ti.xcom_pull(task_ids=task_id, key=key)
+                return _unwrap_xcom_value(_unwrap_xcom_value(ti.xcom_pull(task_ids=task_id, key=key)))
         return None
 
     # tasks.<name>.<field> — 3 parts (result_state, run_id, execution_count)
     if len(parts) == 3:
         _, task_id, field = parts
-        other_ti = get_other_task_instance(task_id, context)
-        if other_ti is None:
-            return None
-        if field == "result_state":
-            return getattr(other_ti, "state", None)
-        if field == "run_id":
-            return getattr(other_ti, "run_id", None)
-        if field == "execution_count":
-            return getattr(other_ti, "try_number", None)
+        if field in ("result_state", "run_id", "execution_count"):
+            info = get_other_task_info(task_id, context)
+            return info["state" if field == "result_state" else field]
         return None
 
     return None

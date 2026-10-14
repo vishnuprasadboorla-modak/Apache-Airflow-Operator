@@ -23,6 +23,7 @@ from airflow.exceptions import AirflowException
 from yeedu.operators.job_operator import YeeduJobRunOperator
 from yeedu.operators.notebook_operator import YeeduNotebookRunOperator
 from yeedu.operators.healthcheck_operator import YeeduHealthCheckOperator
+from yeedu.utils.metadata import TASK_RUN_ID_XCOM_KEY, TASK_EXECUTION_COUNT_XCOM_KEY
 from typing import List
 from urllib.parse import urlparse
 
@@ -217,6 +218,10 @@ class YeeduOperator(BaseOperator):
             value = str(value)
 
         ti.xcom_push(key=composite_key, value=value)
+
+        # read back by {{ tasks.<this task>.run_id }} / {{ tasks.<this task>.execution_count }} in other tasks
+        ti.xcom_push(key=TASK_RUN_ID_XCOM_KEY, value=str(ti.id))
+        ti.xcom_push(key=TASK_EXECUTION_COUNT_XCOM_KEY, value=ti.try_number)
 
         if self.job_type == "job":
             job_operator = YeeduJobRunOperator(

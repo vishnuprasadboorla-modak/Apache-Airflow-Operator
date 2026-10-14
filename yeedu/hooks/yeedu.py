@@ -848,13 +848,20 @@ class YeeduHook(BaseHook):
         spark_job_id, pipeline_notifications, task_notifications); the PUT body
         uses flat fields (task_cluster_id, run_if, job_id, email_notifications).
 
+        PUT now requires tasks/tags/params/max_active_runs/is_paused/schedule_cron/
+        email_notifications on every request — the REST API no longer preserves
+        omitted fields, it clears them. So this always emits all seven, using GET's
+        value where present and the field's empty form ([] / {} / null) otherwise.
+        schedule_timezone has no server-side fallback either, so it's round-tripped
+        too whenever GET has one, to avoid silently clearing it on every edit.
+
         Fields injected into the GET response by the service layer (from Airflow):
           - Pipeline: schedule_cron, is_paused, max_active_runs, tags, params
           - Task / for-each inner task: retries, retry_delay, parameters
         All of these are round-tripped correctly.
 
         Pipeline-level fields stored in the DB and returned directly from GET:
-          - default_start_date, end_date
+          - default_start_date, end_date, schedule_timezone
 
         Task parameters in the GET response are the Airflow-merged set
         (pipeline.params + task-specific params, task wins on conflict).
@@ -864,6 +871,22 @@ class YeeduHook(BaseHook):
         pipeline = pipeline_response.get('pipeline', {})
         tasks = pipeline_response.get('tasks', []) or []
         pipeline_params = pipeline.get('params') or {}
+
+        # is_paused/max_active_runs/tags/params are only ever absent together,
+        # when the GET response's Airflow-DAG-details merge didn't happen (DAG
+        # not parsed yet, or Airflow unreachable at GET time) — see
+        # services/PipelineService.js getPipelineById's early return. In that
+        # case we can't tell "genuinely empty" apart from "unknown", so refuse
+        # rather than silently sending values (e.g. is_paused=False,
+        # max_active_runs=1) that could reset real pipeline state.
+        if pipeline.get('is_paused') is None:
+            raise AirflowException(
+                "Cannot build a PUT body: the GET response for pipeline "
+                f"{pipeline.get('pipeline_id')!r} is missing Airflow DAG details "
+                "(is_paused/max_active_runs/tags/params). The DAG may not be "
+                "parsed yet, or Airflow was unreachable during the GET — retry "
+                "the GET before editing."
+            )
 
         edit_tasks = []
         for task in tasks:
@@ -962,27 +985,43 @@ class YeeduHook(BaseHook):
             edit_task = {k: v for k, v in edit_task.items() if v is not None}
             edit_tasks.append(edit_task)
 
+        # Pipeline-level email_notifications, reconstructed from pipeline_notifications
+        # (stored in pipeline_notification table, returned at top level in GET).
+        # Required on every PUT, so this is {} rather than omitted when there are none.
+        pipeline_email = self._rebuild_email_notifications(
+            pipeline_response.get('pipeline_notifications'), has_on_start=False) or {}
+
+        # These 7 fields are required on every PUT (the API no longer preserves
+        # an omitted field — it clears it), so they're always included here.
+        # tags/params only come back None when the Airflow merge didn't run at
+        # all, which is already guarded against above; schedule_cron is the one
+        # field that's legitimately None (no schedule configured) even when the
+        # merge did run, and the API accepts null for it.
         edit_pipeline = {
             'name': pipeline.get('name'),
             'tasks': edit_tasks,
+            'tags': pipeline.get('tags') or [],
+            'params': pipeline.get('params') or {},
+            'max_active_runs': pipeline.get('max_active_runs'),
+            'is_paused': pipeline.get('is_paused'),
+            'schedule_cron': pipeline.get('schedule_cron'),
+            'email_notifications': pipeline_email,
         }
 
-        # description is in the pipeline DB table — round-trip it
+        # description is DB-backed and IS preserved by the API when omitted, so
+        # it's only sent when GET has a value, same as before.
+        # default_start_date/end_date/schedule_timezone are DB-backed but NOT
+        # preserved when omitted — the API nulls them out on any PUT that
+        # doesn't include them, same as the 7 required fields above — so these
+        # are round-tripped too whenever GET has a value, to avoid silently
+        # clearing them on unrelated edits (e.g. an is_paused toggle).
+        # them when GET actually has a value, same as before.
         if pipeline.get('description') is not None:
             edit_pipeline['description'] = pipeline['description']
-
-        # These are injected by the service from Airflow DAG details — round-trip them
-        for field in ['schedule_cron', 'is_paused', 'max_active_runs', 'tags', 'params', 'default_start_date', 'end_date']:
+        for field in ['default_start_date', 'end_date', 'schedule_timezone']:
             val = pipeline.get(field)
             if val is not None:
                 edit_pipeline[field] = val
-
-        # Reconstruct pipeline-level email_notifications from pipeline_notifications
-        # (stored in pipeline_notification table, returned at top level in GET)
-        pipeline_email = self._rebuild_email_notifications(
-            pipeline_response.get('pipeline_notifications'), has_on_start=False)
-        if pipeline_email:
-            edit_pipeline['email_notifications'] = pipeline_email
 
         return edit_pipeline
 
