@@ -238,6 +238,7 @@ class YeeduOperator(BaseOperator):
                 cluster_ids=self.cluster_ids,
                 logger=self.log.getChild("job_operator")
             )
+            self._active_operator = job_operator
             return job_operator.execute(context)
         elif self.job_type == "notebook":
             notebook_operator = YeeduNotebookRunOperator(
@@ -264,6 +265,16 @@ class YeeduOperator(BaseOperator):
             return health_check_operator.execute(context)
         else:
             raise AirflowException(f"Unknown job_type: {self.job_type}")
+
+    def on_kill(self) -> None:
+        """
+        Called by Airflow when the task is terminated (e.g. the pipeline run is stopped). Stops the Yeedu job run
+        so it does not keep running after its task has gone. Notebook runs are stopped by the notebook operator's
+        own SIGTERM handler.
+        """
+        job_operator = getattr(self, "_active_operator", None)
+        if isinstance(job_operator, YeeduJobRunOperator):
+            job_operator.stop_run()
 
     def _validate_conf(self, conf: List[str]) -> List[str]:
         """

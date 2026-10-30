@@ -505,12 +505,13 @@ class YeeduHook(BaseHook):
         except Exception as e:
             raise AirflowException(e)
 
-    def kill_job(self, run_id: int):
+    def kill_job(self, run_id: int, skip_retry: bool = False):
         try:
             job_kill_url = self.base_url + \
                 f'workspace/{self.workspace_id}/spark/job/run/stop/{run_id}'
             self.log.info(f"Attempting to stop job with run ID {run_id}")
-            response = self._api_request('POST', job_kill_url)
+            response = self._api_request(
+                'POST', job_kill_url, skip_retry=skip_retry)
             if response.status_code == 201:
                 self.log.info(f"Successfully stopped job with run ID {run_id}")
         except Exception as e:

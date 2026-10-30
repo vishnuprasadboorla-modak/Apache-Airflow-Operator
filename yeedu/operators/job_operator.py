@@ -55,6 +55,8 @@ class YeeduJobRunOperator:
             token_variable_name=self.token_variable_name,
         )
         self.run_id: Optional[Union[int, None]] = None
+        # run currently being waited on; set only while it can still be running so on_kill() knows what to stop
+        self._active_run_id: Optional[int] = None
         self.log = logger
 
     def _should_bump_cluster_from_logs(self, run_id: int) -> bool:
@@ -164,6 +166,7 @@ class YeeduJobRunOperator:
 
             # Store the run_id for templating and later use
             self.run_id = run_id
+            self._active_run_id = run_id
 
             # Generate job URL for monitoring
             job_run_url = f"{self.base_url}tenant/{self.tenant_id}/workspace/{self.workspace_id}/run/{run_id}/run-metrics?type=spark_job".replace(
@@ -176,6 +179,7 @@ class YeeduJobRunOperator:
             self.log.info(
                 f"Waiting for job {run_id} to complete")
             job_status = self.hook.wait_for_completion(run_id)
+            self._active_run_id = None
             self.log.info(f"Job {run_id} completed with status: {job_status}")
 
             # Fetch job logs
@@ -221,6 +225,22 @@ class YeeduJobRunOperator:
                 except Exception as stop_error:
                     self.log.warning(
                         f"Error during stopping the job run: {str(stop_error)}")
+
+    def stop_run(self) -> None:
+        """
+        Stop the run that is currently being waited on. Called from YeeduOperator.on_kill() when Airflow
+        terminates the task (the finally block in run_job() does not run in that case). Airflow force-kills
+        the process a few seconds after on_kill(), so this makes a single attempt and never raises.
+        """
+        run_id = self._active_run_id
+        if run_id is None:
+            return
+        try:
+            self.log.info(f"Task terminated, stopping job run {run_id}")
+            self.hook.kill_job(run_id, skip_retry=True)
+        except Exception as stop_error:
+            self.log.warning(
+                f"Error during stopping the job run {run_id}: {stop_error}")
 
     def execute(self, context: dict) -> None:
         """
