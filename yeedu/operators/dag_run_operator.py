@@ -72,10 +72,13 @@ class YeeduDagRunOperator(TriggerDagRunOperator):
     template_fields = tuple(
         f for f in TriggerDagRunOperator.template_fields if f != "conf"
     )
-    def __init__(self, *, loop_input=None, **kwargs):
+    def __init__(self, *, loop_input=None, deferrable=True, **kwargs):
+        # deferrable=True (default) frees the worker slot while the child pipeline runs, but
+        # deferred task instances are not counted by max_active_tis_per_dag(run). A for_each
+        # passes deferrable=False so the task stays RUNNING and its concurrency limit applies.
         super().__init__(
             wait_for_completion=True,
-            deferrable=True,      # <-- key change
+            deferrable=deferrable,
             poke_interval=60,
             **kwargs,
         )
