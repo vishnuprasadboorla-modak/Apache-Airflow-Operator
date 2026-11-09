@@ -10,6 +10,7 @@ from airflow.utils.trigger_rule import TriggerRule
 
 from yeedu.utils.common import (
     resolve_runtime_expr,
+    resolve_condition_operand,
     resolve_all_task_params,
     resolve_foreach_input,
     tr,
@@ -59,6 +60,13 @@ class YeeduRuntimeHook(BaseHook):
         self.log.info("[YeeduRuntimeHook.resolve_expression] BEFORE: %r", expr)
         result = resolve_runtime_expr(expr, context)
         self.log.info("[YeeduRuntimeHook.resolve_expression] AFTER:  %r → %r", expr, result)
+        return result
+
+    def resolve_condition_operand(self, expr: Any, context: Dict[str, Any]) -> Any:
+        """Resolve an if/else condition operand; fails when it is a task value that is a list or dict."""
+        self.log.info("[YeeduRuntimeHook.resolve_condition_operand] BEFORE: %r", expr)
+        result = resolve_condition_operand(expr, context)
+        self.log.info("[YeeduRuntimeHook.resolve_condition_operand] AFTER:  %r → %r", expr, result)
         return result
 
     def get_job_metadata(self, context: Dict[str, Any]) -> Dict[str, Any]:

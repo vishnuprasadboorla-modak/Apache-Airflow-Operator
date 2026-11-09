@@ -6,6 +6,7 @@ import json
 import logging
 import re
 from datetime import timedelta
+from collections.abc import Sequence
 from typing import Any, Dict
 
 from airflow.utils.trigger_rule import TriggerRule
@@ -56,19 +57,38 @@ _RUNTIME_TOKEN_RE = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 _MAX_EXPR_DEPTH = 5
 
 
-def _unwrap_xcom_value(val: Any) -> Any:
-    """
-    Undo one layer of JSON encoding on a string XCom value; non-strings and non-JSON text pass through.
-    A value set with dbutils.jobs.taskValues.set() is encoded twice (dbutils client + Airflow REST create),
-    so this is applied twice by the caller (mirrors unwrapXComValue in the REST API's widgetExprResolver.js).
-    """
-    if not isinstance(val, str):
+class TaskValueNotFoundError(ValueError):
+    """Raised when a {{ tasks.<name>.values.<key> }} reference has no value."""
+
+
+class JobParameterNotFoundError(ValueError):
+    """Raised when a {{ job.parameters.<key> }} reference is not a defined job parameter."""
+
+
+def _decode_task_value(val: Any) -> Any:
+    """Decode a task value set with dbutils.jobs.taskValues.set(); a list of for-each values is decoded per item."""
+    if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
+        return [_decode_task_value(item) for item in val]
+    for _ in range(2):
+        if not isinstance(val, str):
+            break
+        try:
+            val = json.loads(val)
+        except ValueError:
+            break
+    return val
+
+
+def _to_expr_text(val: Any) -> str:
+    """Strings as they are, None as empty, other values as compact JSON."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
         return val
     try:
-        parsed = json.loads(val)
-    except ValueError:
-        return val
-    return parsed if isinstance(parsed, str) else json.dumps(parsed, separators=(",", ":"))
+        return json.dumps(val, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(val)
 
 
 def _current_task_params(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -126,6 +146,8 @@ def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None, _depth: int 
 
         if token.startswith("job.parameters."):
             key = token.split(".", 2)[2]
+            if key not in job_params:
+                raise JobParameterNotFoundError(f"Could not find job parameter '{key}' referenced in '{{{{ {token} }}}}'")
             val = _resolve_nested(job_params.get(key))
             log.info("[resolve_expr]   token=%r → job_params[%r] = %r (type=%s)", token, key, val, type(val).__name__)
             return val
@@ -168,16 +190,33 @@ def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None, _depth: int 
 
     def replacer(match: re.Match) -> str:
         inner = match.group(1)
-        val = _eval_token(inner)
-        return str(val) if val is not None else ""
+        return _to_expr_text(_eval_token(inner))
 
     try:
         result = _RUNTIME_TOKEN_RE.sub(replacer, expr)
         log.info("[resolve_expr] OUTPUT: %r → %r", expr, result)
         return result
+    except (TaskValueNotFoundError, JobParameterNotFoundError):
+        raise
     except Exception as e:
         log.error("[resolve_expr] ERROR resolving %r: %s", expr, e)
         return expr
+
+
+_SINGLE_TASK_VALUE_RE = re.compile(r"^\s*\{\{\s*(tasks\.[^.{}\s]+\.values\.[^{}\s]+)\s*\}\}\s*$")
+
+
+def resolve_condition_operand(expr: Any, context: Dict[str, Any] = None) -> Any:
+    """Resolve an if/else operand; fails when it is a task value that is a list or dict."""
+    match = _SINGLE_TASK_VALUE_RE.match(expr) if isinstance(expr, str) else None
+    if match:
+        value = _eval_other_task_token(match.group(1), context)
+        if isinstance(value, (list, dict)):
+            raise ValueError(
+                f"The condition operand {expr!r} is a task value that is not primitive "
+                f"(numeric, string or boolean). Resolved task value: {_to_expr_text(value)}"
+            )
+    return resolve_runtime_expr(expr, context)
 
 
 def _eval_job_token(token: str, job_meta: Dict[str, Any]) -> Any:
@@ -219,7 +258,7 @@ def _eval_other_task_token(token: str, context: Dict[str, Any]) -> Any:
     Evaluate tokens for other tasks.
 
     Supported patterns:
-      tasks.<name>.values.<key>    → XCom pull (set by dbutils.taskValues.set), JSON layers decoded
+      tasks.<name>.values.<key>    → XCom pull (set by dbutils.taskValues.set), decoded; raises when missing
       tasks.<name>.result_state    → state of that task in this dag run
       tasks.<name>.run_id          → task instance id (UUID) — Yeedu job/notebook tasks only
       tasks.<name>.execution_count → try number — Yeedu job/notebook tasks only
@@ -234,7 +273,10 @@ def _eval_other_task_token(token: str, context: Dict[str, Any]) -> Any:
         if field == "values":
             ti = context.get("ti")
             if ti:
-                return _unwrap_xcom_value(_unwrap_xcom_value(ti.xcom_pull(task_ids=task_id, key=key)))
+                value = _decode_task_value(ti.xcom_pull(task_ids=task_id, key=key))
+                if value is None or (isinstance(value, list) and all(item is None for item in value)):
+                    raise TaskValueNotFoundError(f"Task value referenced by 'tasks.{task_id}.values.{key}' was not found")
+                return value
         return None
 
     # tasks.<name>.<field> — 3 parts (result_state, run_id, execution_count)
