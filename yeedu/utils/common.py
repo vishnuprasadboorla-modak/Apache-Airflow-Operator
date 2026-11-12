@@ -65,6 +65,18 @@ class JobParameterNotFoundError(ValueError):
     """Raised when a {{ job.parameters.<key> }} reference is not a defined job parameter."""
 
 
+class TaskParameterNotFoundError(ValueError):
+    """Raised when a {{ task.params.<key> }} reference is not a parameter of the task."""
+
+
+class ReferenceResolutionError(ValueError):
+    """Raised when a reference fails to resolve for any other reason."""
+
+
+# Reference errors that fail the task instead of leaving the expression unresolved
+REFERENCE_ERRORS = (TaskValueNotFoundError, JobParameterNotFoundError, TaskParameterNotFoundError, ReferenceResolutionError)
+
+
 def _decode_task_value(val: Any) -> Any:
     """Decode a task value set with dbutils.jobs.taskValues.set(); a list of for-each values is decoded per item."""
     if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
@@ -159,7 +171,10 @@ def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None, _depth: int 
 
         if token.startswith("task.params."):
             key = token.split(".", 2)[2]
-            val = _resolve_nested(_current_task_params(context).get(key))
+            task_params = _current_task_params(context)
+            if key not in task_params:
+                raise TaskParameterNotFoundError(f"Could not find task parameter '{key}' referenced in '{{{{ {token} }}}}'")
+            val = _resolve_nested(task_params.get(key))
             log.info("[resolve_expr]   token=%r → task_params[%r] = %r (type=%s)", token, key, val, type(val).__name__)
             return val
 
@@ -196,11 +211,11 @@ def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None, _depth: int 
         result = _RUNTIME_TOKEN_RE.sub(replacer, expr)
         log.info("[resolve_expr] OUTPUT: %r → %r", expr, result)
         return result
-    except (TaskValueNotFoundError, JobParameterNotFoundError):
+    except REFERENCE_ERRORS:
         raise
     except Exception as e:
         log.error("[resolve_expr] ERROR resolving %r: %s", expr, e)
-        return expr
+        raise ReferenceResolutionError(f"Unexpected error while resolving references in {expr!r}: {e}") from e
 
 
 _SINGLE_TASK_VALUE_RE = re.compile(r"^\s*\{\{\s*(tasks\.[^.{}\s]+\.values\.[^{}\s]+)\s*\}\}\s*$")

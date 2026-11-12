@@ -24,6 +24,7 @@ from yeedu.operators.job_operator import YeeduJobRunOperator
 from yeedu.operators.notebook_operator import YeeduNotebookRunOperator
 from yeedu.operators.healthcheck_operator import YeeduHealthCheckOperator
 from yeedu.utils.metadata import TASK_RUN_ID_XCOM_KEY, TASK_EXECUTION_COUNT_XCOM_KEY
+from yeedu.utils.common import resolve_all_task_params, REFERENCE_ERRORS
 from typing import List
 from urllib.parse import urlparse
 
@@ -223,6 +224,9 @@ class YeeduOperator(BaseOperator):
         ti.xcom_push(key=TASK_RUN_ID_XCOM_KEY, value=str(ti.id))
         ti.xcom_push(key=TASK_EXECUTION_COUNT_XCOM_KEY, value=ti.try_number)
 
+        if self.job_type in ("job", "notebook"):
+            self._check_task_params(context)
+
         if self.job_type == "job":
             job_operator = YeeduJobRunOperator(
                 job_id=self.conf_id,
@@ -265,6 +269,32 @@ class YeeduOperator(BaseOperator):
             return health_check_operator.execute(context)
         else:
             raise AirflowException(f"Unknown job_type: {self.job_type}")
+
+    def _check_task_params(self, context) -> None:
+        """
+        Fail before the run is submitted when a task parameter references a task value, job parameter or
+        task parameter that does not exist. Only checks the references; the run still resolves the values itself.
+        """
+        dag_params = self._param_values(getattr(context.get("dag"), "params", None))
+        task_params = {
+            key: value for key, value in self._param_values(self.params).items()
+            if key not in dag_params or dag_params[key] != value
+        }
+        try:
+            resolve_all_task_params(task_params, context)
+        except REFERENCE_ERRORS as e:
+            self.log.error(str(e))
+            raise AirflowException(str(e)) from e
+        except Exception as e:
+            # Not a reference error (e.g. metadata lookup failed), keep the previous behaviour and run the task
+            self.log.warning("Could not check task parameter references: %s", e)
+
+    @staticmethod
+    def _param_values(params) -> dict:
+        """Plain key/value dict of Airflow params (ParamsDict or dict)."""
+        if not params:
+            return {}
+        return dict(params.dump()) if hasattr(params, "dump") else dict(params)
 
     def on_kill(self) -> None:
         """
