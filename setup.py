@@ -24,6 +24,12 @@ setup(
         'rel>=0.4.9.19',
         'cron_descriptor',
     ],
+    entry_points={
+        # Registers the interval timetable without files into the plugins folder
+        'airflow.plugins': [
+            'fixed_interval_timetable_plugin = yeedu.plugins.fixed_interval_timetable_plugin:FixedIntervalTimetablePlugin',
+        ],
+    },
     project_urls={
         'GitHub': 'https://github.com/yeedu-io/Apache-Airflow-Operator',
     },
