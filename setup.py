@@ -25,9 +25,10 @@ setup(
         'cron_descriptor',
     ],
     entry_points={
-        # Registers the interval timetable without files into the plugins folder
+        # Registers the timetables with Airflow without copying files into the plugins folder
         'airflow.plugins': [
             'fixed_interval_timetable_plugin = yeedu.plugins.fixed_interval_timetable_plugin:FixedIntervalTimetablePlugin',
+            'quartz_timetable_plugin = yeedu.plugins.quartz_timetable_plugin:QuartzTimetablePlugin',
         ],
     },
     project_urls={
