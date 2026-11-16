@@ -497,7 +497,7 @@ def resolve_foreach_input(
                     f"but it was not found in tasks dict"
                 )
             result = XComArg(tasks_dict[task_id], key=key)
-            log.info("[resolve_foreach_input] Case 2 (XComArg): task_id=%r, key=%r → %r", task_id, key, result)
+            log.debug("[resolve_foreach_input] Case 2 (XComArg): task_id=%r, key=%r → %r", task_id, key, result)
             return result
 
     # Case 3: job.parameters.<param> → resolve from dag_params at parse time

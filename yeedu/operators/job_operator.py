@@ -140,7 +140,7 @@ class YeeduJobRunOperator:
                     task_instance_id = str(ti.id) if ti.id else None  # Convert UUID to string
                     try_number = ti.try_number
                     map_index = ti.map_index
-                    self.log.info(
+                    self.log.debug(
                         "Pipeline context for submit_job: task_id=%s dag_id=%s run_id=%s try_number=%s map_index=%s",
                         task_name,
                         dag_id,
@@ -149,7 +149,6 @@ class YeeduJobRunOperator:
                         map_index,
                     )
 
-            self.log.info(f"Submitting job {self.job_id}")
             run_id = self.hook.submit_job(
                 job_id=self.job_id,
                 task_cluster_id=cluster_id if cluster_id is not None else self.task_cluster_id,
@@ -267,12 +266,12 @@ class YeeduJobRunOperator:
                 # 1. Extract username, dag_id from context/DAG params
                 username, dag_id = self.hook._get_username_dagid_from_context(context)
                 if not username:
-                    raise AirflowException("Username not found in DAG context for pipeline authentication")
+                    raise AirflowException("Could not identify the user who runs this pipeline.")
 
                 # 2. Get tenant_id from workspace (workspace_id is prefix of dag_id)
                 workspace_id = dag_id.split("_")[0] if dag_id else None
                 if not workspace_id:
-                    raise AirflowException("Could not extract workspace_id from dag_id for pipeline authentication")
+                    raise AirflowException("Could not identify the workspace of this pipeline.")
 
                 workspace_details = self.hook.get_workspace_details(int(workspace_id))
                 tenant_id = workspace_details.get('tenant_id')

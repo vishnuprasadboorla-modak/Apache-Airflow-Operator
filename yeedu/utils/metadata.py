@@ -99,7 +99,7 @@ def get_job_meta(context: Dict[str, Any]) -> Dict[str, Any]:
             "type": _extract_trigger_type(dag_run),
         },
     }
-    log.info("[get_job_meta] dag_id=%s, job_id=%s, name=%s, run_id=%s, trigger_type=%s",
+    log.debug("[get_job_meta] dag_id=%s, job_id=%s, name=%s, run_id=%s, trigger_type=%s",
              dag_id, meta["id"], meta["name"], meta["run_id"], meta["trigger"]["type"])
     log.info("[get_job_meta] start_time=%s", meta["start_time"])
     return meta
@@ -127,7 +127,7 @@ def get_job_parameters(context: Dict[str, Any]) -> Dict[str, Any]:
     conf = (dag_run and (dag_run.conf or {})) or {}
     merged = dict(dag_params)
     merged.update(conf)
-    log.info("[get_job_parameters] dag_params=%s", dag_params)
+    log.debug("[get_job_parameters] dag_params=%s", dag_params)
     log.info("[get_job_parameters] conf_overrides=%s", conf)
     log.info("[get_job_parameters] merged=%s", merged)
     return merged
@@ -175,13 +175,13 @@ def get_other_task_instance(task_id: str, context: Dict[str, Any]):
     if dag_run:
         try:
             ti = dag_run.get_task_instance(task_id)
-            log.info("[get_other_task_instance] task_id=%s → state=%s, run_id=%s",
+            log.debug("[get_other_task_instance] task_id=%s → state=%s, run_id=%s",
                      task_id, getattr(ti, "state", None), getattr(ti, "run_id", None))
             return ti
         except Exception as e:
             log.debug("[get_other_task_instance] task_id=%s → %s", task_id, e)
             return None
-    log.warning("[get_other_task_instance] dag_run is None, cannot look up task_id=%s", task_id)
+    log.warning("Could not find the run of task '%s' in this pipeline run.", task_id)
     return None
 
 
@@ -190,7 +190,7 @@ def _pull_xcom_scalar(ti, task_id: str, key: str):
     try:
         val = ti.xcom_pull(task_ids=task_id, key=key)
     except Exception as e:
-        log.warning("[get_other_task_info] xcom_pull task_id=%s key=%s → %s", task_id, key, e)
+        log.warning("Could not read task value '%s' of task '%s': %s", key, task_id, e)
         return None
     return val if isinstance(val, (str, int)) else None
 

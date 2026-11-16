@@ -102,29 +102,22 @@ class YeeduHook(BaseHook):
 
                 # check for the ssl cert dir
                 if not self.YEEDU_SSL_CERT_FILE:
-                    self.log.error(
-                        f"SSL verification is enabled but [YEEDU_AIRFLOW_VERIFY_SSL (default: true)] is not provided")
-                    raise AirflowException(
-                        f"SSL verification is enabled [YEEDU_AIRFLOW_VERIFY_SSL (default: true)] but YEEDU_SSL_CERT_FILE is not provided")
+                    self.log.error("SSL verification is on but no certificate file is configured. Contact your administrator.")
+                    raise AirflowException("SSL verification is on but no certificate file is configured. Contact your administrator.")
                 else:
                     # check if the file exists or not
                     if os.path.isfile(self.YEEDU_SSL_CERT_FILE):
                         return self.YEEDU_SSL_CERT_FILE
                     else:
-                        self.log.error(
-                            f"Provided YEEDU_SSL_CERT_FILE: {self.YEEDU_SSL_CERT_FILE} does not exist")
-                        raise AirflowException(
-                            f"Provided YEEDU_SSL_CERT_FILE: {self.YEEDU_SSL_CERT_FILE} does not exist")
+                        self.log.error(f"SSL certificate file '{self.YEEDU_SSL_CERT_FILE}' does not exist. Contact your administrator.")
+                        raise AirflowException(f"SSL certificate file '{self.YEEDU_SSL_CERT_FILE}' does not exist. Contact your administrator.")
             elif self.YEEDU_AIRFLOW_VERIFY_SSL == 'false':
-                self.log.info(
-                    "SSL verification is disabled, as YEEDU_AIRFLOW_VERIFY_SSL is set to false")
+                self.log.info("SSL verification is disabled.")
                 return False
 
             else:
-                self.log.error(
-                    f"Invalid value for YEEDU_AIRFLOW_VERIFY_SSL: '{self.YEEDU_AIRFLOW_VERIFY_SSL}'. Must be 'true' or 'false'")
-                raise AirflowException(
-                    f"Invalid value for YEEDU_AIRFLOW_VERIFY_SSL: '{self.YEEDU_AIRFLOW_VERIFY_SSL}'. Must be 'true' or 'false'")
+                self.log.error(f"SSL verification setting '{self.YEEDU_AIRFLOW_VERIFY_SSL}' is not valid. Contact your administrator.")
+                raise AirflowException(f"SSL verification setting '{self.YEEDU_AIRFLOW_VERIFY_SSL}' is not valid. Contact your administrator.")
 
         except Exception as e:
             self.log.error(f"SSL verification configuration failed: {e}")
@@ -150,7 +143,7 @@ class YeeduHook(BaseHook):
                     "The authentication type is set to Azure_SSO. Please provide a token to schedule jobs or notebooks.")
         else:
             raise AirflowException(
-                f"The current AirflowOperator only supports LDAP, AAD, and Azure_SSO authentication types, but received {auth_type}.")
+                f"Authentication type '{auth_type}' is not supported. Supported types: LDAP, AAD, AZURE_SSO.")
 
     def _api_request(self, method: str, url: str, data=None, params: Optional[Dict] = None, max_attempts: int = 5, delay: int = 20, skip_retry: bool = False, headers: Optional[Dict] = None) -> requests.Response:
         """
@@ -319,7 +312,7 @@ class YeeduHook(BaseHook):
                     return token
             else:
                 raise AirflowException(
-                    f"The current AirflowOperator only supports LDAP, AAD, and Azure_SSO authentication types, but received {auth_type}.")
+                    f"Authentication type '{auth_type}' is not supported. Supported types: LDAP, AAD, AZURE_SSO.")
         except Exception as e:
             self.log.error(f"Login to Yeedu failed: {e}")
             raise AirflowException(e)
@@ -437,13 +430,11 @@ class YeeduHook(BaseHook):
             data['map_index'] = map_index
 
             self.log.info(
-                "submit_job payload: job_id=%s dag_id=%s dag_run_id=%s task_name=%s try_number=%s map_index=%s",
+                "Submitting job %s for task '%s', attempt %s%s.",
                 data.get('job_id'),
-                data.get('dag_id'),
-                data.get('dag_run_id'),
                 data.get('task_name'),
                 data.get('try_number'),
-                data.get('map_index'),
+                f", loop item {data['map_index']}" if (data.get('map_index') is not None and data['map_index'] >= 0) else "",
             )
 
             response = self._api_request('POST', job_url, data)
@@ -882,11 +873,7 @@ class YeeduHook(BaseHook):
         # max_active_runs=1) that could reset real pipeline state.
         if pipeline.get('is_paused') is None:
             raise AirflowException(
-                "Cannot build a PUT body: the GET response for pipeline "
-                f"{pipeline.get('pipeline_id')!r} is missing Airflow DAG details "
-                "(is_paused/max_active_runs/tags/params). The DAG may not be "
-                "parsed yet, or Airflow was unreachable during the GET — retry "
-                "the GET before editing."
+                f"Pipeline {pipeline.get('pipeline_id')} is still being set up. Try again in a minute."
             )
 
         edit_tasks = []

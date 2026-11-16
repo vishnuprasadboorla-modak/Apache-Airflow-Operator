@@ -208,13 +208,11 @@ class YeeduNotebookRunOperator:
                     data['map_index'] = -1 if map_index is None else map_index
 
             self.log.info(
-                "create_notebook_instance payload: notebook_id=%s dag_id=%s dag_run_id=%s task_name=%s try_number=%s map_index=%s",
+                "Starting notebook %s for task '%s', attempt %s%s.",
                 data.get('notebook_id'),
-                data.get('dag_id'),
-                data.get('dag_run_id'),
                 data.get('task_name'),
                 data.get('try_number'),
-                data.get('map_index'),
+                f", loop item {data['map_index']}" if (data.get('map_index') is not None and data['map_index'] >= 0) else "",
             )
                     
             post_url = self.base_url + \
@@ -1308,12 +1306,12 @@ class YeeduNotebookRunOperator:
                 # 1. Extract username, dag_id from context/DAG params
                 username, dag_id = self.hook._get_username_dagid_from_context(context)
                 if not username:
-                    raise AirflowException("Username not found in DAG context for pipeline authentication")
+                    raise AirflowException("Could not identify the user who runs this pipeline.")
 
                 # 2. Get tenant_id from workspace (workspace_id is prefix of dag_id)
                 workspace_id = dag_id.split("_")[0] if dag_id else None
                 if not workspace_id:
-                    raise AirflowException("Could not extract workspace_id from dag_id for pipeline authentication")
+                    raise AirflowException("Could not identify the workspace of this pipeline.")
 
                 workspace_details = self.hook.get_workspace_details(int(workspace_id))
                 tenant_id = workspace_details.get('tenant_id')

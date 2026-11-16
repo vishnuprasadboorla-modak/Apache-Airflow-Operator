@@ -31,7 +31,7 @@ def dag_success_cb_factory(recipients: List[str]) -> Callable[[Dict[str, Any]], 
                     context=context,
                 )
             except Exception as e:
-                log.error("Email notification failed for DAG success callback: %s", e, exc_info=True)
+                log.error("Could not send the pipeline success email: %s", e, exc_info=True)
     return _cb
 
 
@@ -56,7 +56,7 @@ def dag_failure_cb_factory(recipients: List[str]) -> Callable[[Dict[str, Any]], 
                     context=context,
                 )
             except Exception as e:
-                log.error("Email notification failed for DAG failure callback: %s", e, exc_info=True)
+                log.error("Could not send the pipeline failure email: %s", e, exc_info=True)
     return _cb
 
 
@@ -81,7 +81,7 @@ def dag_start_cb_factory(recipients: List[str]) -> Callable[[Dict[str, Any]], No
                     context=context,
                 )
             except Exception as e:
-                log.error("Email notification failed for DAG start callback: %s", e, exc_info=True)
+                log.error("Could not send the pipeline start email: %s", e, exc_info=True)
     return _cb
 
 

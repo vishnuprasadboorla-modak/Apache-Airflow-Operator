@@ -156,7 +156,7 @@ class YeeduRuntimeHook(BaseHook):
             dag_params: DAG-level parameters for job.parameters.* resolution
             task_params: Task-level parameters for task.parameters.* resolution
         """
-        self.log.info("[YeeduRuntimeHook.resolve_foreach_input] BEFORE: expr=%r, dag_params=%s, task_params=%s",
+        self.log.debug("[YeeduRuntimeHook.resolve_foreach_input] BEFORE: expr=%r, dag_params=%s, task_params=%s",
                       expr, dag_params, task_params)
         result = resolve_foreach_input(expr, tasks_dict, dag_params, task_params)
         self.log.info("[YeeduRuntimeHook.resolve_foreach_input] AFTER:  expr=%r → %r (type=%s)",
