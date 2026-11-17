@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import timedelta
 from typing import Any, Dict, List, Callable
 
@@ -32,6 +34,50 @@ from yeedu.utils.metadata import (
     get_current_task_meta,
     get_workspace_meta
 )
+
+# Prefix of the one structured log line the Yeedu task logs API returns as branch_result
+BRANCH_RESULT_PREFIX = "Branch result: "
+
+# Condition operators and the symbol shown in task logs
+CONDITION_SYMBOLS = {
+    "EQUAL_TO": "==", "EQ": "==", "NOT_EQUAL": "!=", "NE": "!=",
+    "GREATER_THAN": ">", "LESS_THAN": "<",
+    "GREATER_THAN_OR_EQUAL": ">=", "GE": ">=", "LESS_THAN_OR_EQUAL": "<=", "LE": "<=",
+}
+ORDERING_OPERATORS = ("GREATER_THAN", "LESS_THAN", "GREATER_THAN_OR_EQUAL", "LESS_THAN_OR_EQUAL", "GE", "LE")
+NUMBER = re.compile(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*")
+
+
+def _shown(operand: Any) -> str:
+    """An operand as written: references stay as they are, constants are quoted (like Databricks)."""
+    text = str(operand)
+    return text if "{{" in text else json.dumps(text, ensure_ascii=False)
+
+
+def _quoted(value: Any) -> str:
+    """A resolved value, quoted."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def compare_condition(left_val: Any, op: str, right_val: Any) -> bool:
+    """Compares resolved operands; ordering operators need numbers and fail the task otherwise."""
+    if op in ORDERING_OPERATORS:
+        for side, val in (("left", left_val), ("right", right_val)):
+            if not NUMBER.fullmatch(str(val)):
+                raise ValueError(f'Numeric operand "{side}" is not a valid number. Actual value: {val}')
+    if op == "GREATER_THAN":
+        return float(left_val) > float(right_val)
+    if op == "LESS_THAN":
+        return float(left_val) < float(right_val)
+    if op in ("EQUAL_TO", "EQ"):
+        return str(left_val) == str(right_val)
+    if op in ("NOT_EQUAL", "NE"):
+        return str(left_val) != str(right_val)
+    if op in ("GREATER_THAN_OR_EQUAL", "GE"):
+        return float(left_val) >= float(right_val)
+    if op in ("LESS_THAN_OR_EQUAL", "LE"):
+        return float(left_val) <= float(right_val)
+    return bool(left_val)
 
 
 class YeeduRuntimeHook(BaseHook):
@@ -68,6 +114,89 @@ class YeeduRuntimeHook(BaseHook):
         result = resolve_condition_operand(expr, context)
         self.log.info("[YeeduRuntimeHook.resolve_condition_operand] AFTER:  %r → %r", expr, result)
         return result
+
+    def _log_branch_result(self, result: Dict[str, Any]) -> None:
+        """Logs the structured result that the task logs API returns as branch_result."""
+        self.log.info("%s%s", BRANCH_RESULT_PREFIX, json.dumps(result, ensure_ascii=False, default=str))
+
+    def _log_next_tasks(self, targets: List[str], outcome: str) -> None:
+        if targets:
+            self.log.info("Next tasks: %s", ", ".join(targets))
+        else:
+            self.log.info("No task runs on the %s outcome.", outcome)
+
+    def evaluate_condition(self, left: Any, op: str, right: Any, true_targets: List[str],
+                           false_targets: List[str], context: Dict[str, Any]) -> List[str]:
+        """
+        Evaluates an if/else condition, logs it like Databricks (original, resolved, outcome)
+        and returns the tasks to run next. Errors still fail the task.
+        """
+        symbol = CONDITION_SYMBOLS.get(op, op)
+        result: Dict[str, Any] = {
+            "type": "condition",
+            "original": {"left": left, "op": op, "right": right},
+            "resolved": None,
+            "outcome": None,
+        }
+        self.log.info("Original expression: %s %s %s", _shown(left), symbol, _shown(right))
+        try:
+            left_val = resolve_condition_operand(left, context)
+            right_val = resolve_condition_operand(right, context)
+            result["resolved"] = {"left": str(left_val), "right": str(right_val)}
+            self.log.info("Resolved expression: %s %s %s", _quoted(left_val), symbol, _quoted(right_val))
+            matched = compare_condition(left_val, op, right_val)
+        except Exception as e:
+            result["error"] = str(e)
+            self._log_branch_result(result)
+            raise
+
+        result["outcome"] = "true" if matched else "false"
+        targets = list(true_targets if matched else false_targets)
+        result["next_tasks"] = targets
+        self.log.info("Expression outcome: %s", result["outcome"])
+        self._log_next_tasks(targets, result["outcome"])
+        self._log_branch_result(result)
+        return targets
+
+    def evaluate_switch(self, expr: Any, case_targets: Dict[str, List[str]],
+                        default_targets: List[str], context: Dict[str, Any]) -> List[str]:
+        """
+        Evaluates a switch, logs the expression, its resolved value and the matched case,
+        and returns the tasks to run next. Errors still fail the task.
+        """
+        result: Dict[str, Any] = {
+            "type": "switch",
+            "original": {"expr": expr, "cases": [str(case) for case in case_targets]},
+            "resolved": None,
+            "outcome": None,
+        }
+        self.log.info("Expression: %s", _shown(expr))
+        try:
+            value = resolve_runtime_expr(expr, context)
+            result["resolved"] = {"expr": str(value)}
+            self.log.info("Resolved value: %s", _quoted(value))
+            matched_case = None
+            for case_value in case_targets:
+                if str(value) == str(resolve_runtime_expr(str(case_value), context)):
+                    matched_case = case_value
+                    break
+        except Exception as e:
+            result["error"] = str(e)
+            self._log_branch_result(result)
+            raise
+
+        if matched_case is None:
+            result["outcome"] = "default"
+            targets = list(default_targets)
+            self.log.info("No case matched, using default.")
+        else:
+            result["outcome"] = str(matched_case)
+            targets = list(case_targets[matched_case])
+            self.log.info("Matched case: %s", _quoted(matched_case))
+        result["next_tasks"] = targets
+        self._log_next_tasks(targets, result["outcome"])
+        self._log_branch_result(result)
+        return targets
 
     def get_job_metadata(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """
