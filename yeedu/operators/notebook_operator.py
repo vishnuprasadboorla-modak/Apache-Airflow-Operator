@@ -291,14 +291,7 @@ class YeeduNotebookRunOperator:
                     return
 
                 if notebook_status in TERMINAL_STATES:
-                    notebook_run_url = (
-                        f"{self.base_url}tenant/{self.tenant_id}/workspace/{self.workspace_id}"
-                        f"/spark/run/{self.run_id}/run-logs?log_type=stderr"
-                    ).replace(f":{self.restapi_port}/api/v1", "")
-                    raise AirflowException(
-                        f"Notebook is in {notebook_status} state.\n"
-                        f"Please check notebook logs for detailed error: {notebook_run_url}"
-                    )
+                    raise self._notebook_not_running_error(notebook_status)
 
                 self.log.info(
                     f"Notebook is in '{notebook_status}' state. Retrying after {NOTEBOOK_GET_STATUS_DELAY_SECONDS} seconds...")
@@ -320,7 +313,16 @@ class YeeduNotebookRunOperator:
                 time.sleep(10)
 
             for retry in range(1, max_retries + 1):
+                # A failed cell has already stopped the notebook; the caller reports the cell error
+                if not self.notebook_executed or self.should_bump_cluster:
+                    return
                 kernel_response = self.hook._api_request("POST", kernel_url)
+                # 409: the notebook run is no longer RUNNING, so its kernel can never start
+                if kernel_response.status_code == 409:
+                    notebook_status = self.check_notebook_instance_status()
+                    if notebook_status != "RUNNING":
+                        raise self._notebook_not_running_error(notebook_status)
+                    raise AirflowException(self._api_error_message(kernel_response))
                 kernel_info = kernel_response.json().get("kernel_info", {})
                 kernel_status = kernel_info.get("kernel_status")
                 self.log.info(
@@ -349,6 +351,47 @@ class YeeduNotebookRunOperator:
 
     def check_kernel_status(self, status: str) -> bool:
         return status in ["idle", "starting", "busy"]
+
+    def _api_error_message(self, response) -> str:
+        """error_message from a Yeedu API error response, or its raw text."""
+        try:
+            body = response.json()
+            return body.get("error_message") or body.get("message") or response.text
+        except Exception:
+            return response.text
+
+    def _notebook_failure_reason(self):
+        """Last fatal or error line from the notebook run's stderr, or None when there is none."""
+        try:
+            stderr = self.hook.get_notebook_logs(
+                self.run_id, "stderr", last_n_lines=50) or ""
+        except Exception as e:
+            self.log.warning(f"Could not read the logs of notebook run {self.run_id}: {e}")
+            return None
+        failure = re.compile(
+            r"fatal|error|exception|failed|no such file|not found|permission denied|cannot|refused", re.IGNORECASE)
+        for line in reversed(stderr.splitlines()):
+            if failure.search(line):
+                return line.strip()[:500]
+        return None
+
+    def _notebook_not_running_error(self, notebook_status):
+        """Error for a notebook run that stopped before its cells ran, with the reason from its logs."""
+        notebook_run_url = (
+            f"{self.base_url}tenant/{self.tenant_id}/workspace/{self.workspace_id}"
+            f"/run/{self.run_id}/run-logs?log_type=stderr"
+        ).replace(f":{self.restapi_port}/api/v1", ":5173")
+        reason = self._notebook_failure_reason()
+        return AirflowException(
+            f"Notebook is in {notebook_status} state{': ' + reason if reason else '.'}\n"
+            f"Please check notebook logs for detailed error: {notebook_run_url}"
+        )
+
+    def _cell_error_message(self):
+        """The error of the failed cell, or None (CleanExit from dbutils.notebook.exit() is not a failure)."""
+        if self.error_name and self.error_name != "CleanExit":
+            return f"{self.error_name} - {self.error_value}"
+        return None
 
     def get_websocket_token(self):
         try:
@@ -1422,6 +1465,10 @@ class YeeduNotebookRunOperator:
 
                         time.sleep(10)
 
+                        # A cell may have failed and stopped the notebook while we slept
+                        if self.should_bump_cluster or not self.notebook_executed:
+                            continue
+
                         self.log.info(
                             f"Waiting for {len(self.notebook_cells)} cell(s) to finish execution.")
 
@@ -1481,6 +1528,8 @@ class YeeduNotebookRunOperator:
                         self.notebook_json = {}
                         # Reset execution state for fresh start
                         self.notebook_executed = True
+                        self.error_name = None
+                        self.error_value = None
                         continue
 
                     # If execution was successful, stop the cluster bumping loop
@@ -1574,6 +1623,12 @@ class YeeduNotebookRunOperator:
                     f"Notebook execution failed on existings cluster and all {len(self.cluster_ids)} bump clusters")
 
         except Exception as e:
+            # A failed cell is the real cause; anything raised after it (kernel status, websocket) is a side effect
+            cell_error = self._cell_error_message()
+            if cell_error and cell_error not in str(e):
+                self.log.error(f"Notebook execution failed with error:  {cell_error}")
+                self.log.info(f"Error raised after the cell failed: {e}")
+                raise AirflowException(cell_error) from e
             self.log.error(f"Notebook execution failed with error:  {e}")
             raise e
         finally:
