@@ -114,6 +114,18 @@ def _current_task_params(context: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
+# Fields the resolver knows under job., task., tasks. and workspace.; anything else there is an invalid reference
+_TIME_FIELDS = r"(day|hour|is_weekday|iso_date|iso_datetime|iso_weekday|minute|month|second|timestamp_ms|year)"
+_NAME = r"[a-zA-Z0-9_\-]+"
+_KNOWN_NAMESPACES = ("job.", "task.", "tasks.", "workspace.")
+_KNOWN_REFERENCE_RE = re.compile(
+    rf"^(job\.(id|name|run_id|start_time\.{_TIME_FIELDS}|trigger\.time\.{_TIME_FIELDS}|trigger\.type|parameters\.{_NAME})"
+    rf"|task\.(execution_count|name|notebook_path|params\.{_NAME}|run_id)"
+    rf"|tasks\.{_NAME}\.(values\.{_NAME}|result_state|run_id|execution_count)"
+    rf"|workspace\.(id|url))$"
+)
+
+
 def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None, _depth: int = 0) -> Any:
     """
     Resolve runtime expressions in strings.
@@ -155,6 +167,10 @@ def resolve_runtime_expr(expr: Any, context: Dict[str, Any] = None, _depth: int 
 
     def _eval_token(token: str) -> Any:
         token = token.strip()
+
+        # A typo such as job.runid would otherwise resolve to None and the task would run with it
+        if token.startswith(_KNOWN_NAMESPACES) and not _KNOWN_REFERENCE_RE.match(token):
+            raise ReferenceResolutionError(f"Invalid reference: '{token}'.")
 
         if token.startswith("job.parameters."):
             key = token.split(".", 2)[2]
